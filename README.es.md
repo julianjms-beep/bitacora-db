@@ -212,3 +212,7 @@ tests/           recuperación (kill -9, cola rota, bit corrupto) y concurrencia
   eso habría que pasar a un *pool* o a `epoll/kqueue`. Está limitado por
   `--max-conns`.
 * **Sin transacciones multi-clave ni TTL**: fuera del alcance a propósito.
+
+## Licencia
+
+MIT — ver [LICENSE](LICENSE). Úsalo, modifícalo y distribúyelo; solo hay que conservar el aviso de copyright.

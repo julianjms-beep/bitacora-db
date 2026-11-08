@@ -240,3 +240,7 @@ tests/           recovery (kill -9, torn tail, flipped bit) and concurrency
 * **One thread per connection** scales to hundreds of clients, not a hundred thousand;
   that would call for a thread pool or `epoll`/`kqueue`. Bounded by `--max-conns`.
 * **No multi-key transactions and no TTL** — deliberately out of scope.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it, change it, ship it; just keep the copyright notice.
