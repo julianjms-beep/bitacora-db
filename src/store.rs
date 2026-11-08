@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsyncPolicy {
@@ -59,6 +59,67 @@ impl FsyncPolicy {
     }
 }
 
+/// Qué hacer si al abrir se detecta **corrupción** (un registro ilegible con
+/// registros válidos detrás), que es distinto de una cola de escritura
+/// incompleta por un apagón.
+///
+/// Una cola incompleta es el caso normal tras un fallo y se recorta siempre:
+/// no hay nada confirmado detrás que perder. La corrupción no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryPolicy {
+    /// **Por defecto.** Si hay corrupción, `open` falla y **no modifica ningún
+    /// fichero**. Una recuperación incompleta no se presenta nunca como
+    /// satisfactoria.
+    Estricto,
+    /// Abre saltándose los registros ilegibles, después de copiar cada
+    /// segmento afectado a `NNNNNN.log.corrupto-<epoch>`. El informe
+    /// ([`Db::recovery_report`]) dice exactamente qué se perdió.
+    Reparar,
+}
+
+impl RecoveryPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "estricto" | "strict" => Some(RecoveryPolicy::Estricto),
+            "reparar" | "repair" => Some(RecoveryPolicy::Reparar),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RecoveryPolicy::Estricto => "estricto",
+            RecoveryPolicy::Reparar => "reparar",
+        }
+    }
+}
+
+/// Qué pasó exactamente al reconstruir el índice. Se consulta con
+/// [`Db::recovery_report`] y sale en `STATS`.
+#[derive(Clone, Debug, Default)]
+pub struct RecoveryReport {
+    pub segments: u64,
+    pub records_ok: u64,
+    /// Registros ilegibles que se saltaron (solo en modo `Reparar`).
+    pub corrupt_records: u64,
+    /// Bytes ilegibles saltados.
+    pub corrupt_bytes: u64,
+    /// Colas de escritura incompleta recortadas: `(fichero, byte)`.
+    pub truncated_tails: Vec<(PathBuf, u64)>,
+    /// Copias de seguridad hechas antes de tocar nada.
+    pub quarantined: Vec<PathBuf>,
+    /// Detalle legible de cada zona ilegible.
+    pub detalle: Vec<String>,
+}
+
+impl RecoveryReport {
+    /// `true` si se perdió algún registro válido. Si es `true`, la
+    /// recuperación **no** fue íntegra.
+    pub fn con_perdidas(&self) -> bool {
+        self.corrupt_records > 0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub dir: PathBuf,
@@ -75,6 +136,8 @@ pub struct Options {
     pub auto_compact: bool,
     pub compact_min_dead_bytes: u64,
     pub compact_dead_ratio: f64,
+    /// Qué hacer ante corrupción al abrir. Ver [`RecoveryPolicy`].
+    pub recovery: RecoveryPolicy,
 }
 
 impl Options {
@@ -89,6 +152,7 @@ impl Options {
             auto_compact: true,
             compact_min_dead_bytes: 16 << 20,
             compact_dead_ratio: 0.5,
+            recovery: RecoveryPolicy::Estricto,
         }
     }
 }
@@ -161,6 +225,8 @@ struct Inner {
     compacting: AtomicBool,
     live: AtomicU64,
     dead: AtomicU64,
+    /// Qué pasó al reconstruir el índice al abrir.
+    recovery: RecoveryReport,
 }
 
 pub struct Db {
@@ -181,6 +247,10 @@ pub struct Stats {
     pub synced_seq: u64,
     pub fsync: String,
     pub compacting: bool,
+    /// Zonas ilegibles saltadas al abrir. Si no es 0, **se perdieron datos**.
+    pub recovery_corrupt_records: u64,
+    pub recovery_corrupt_bytes: u64,
+    pub recovery_truncated_tails: u64,
 }
 
 impl Stats {
@@ -196,6 +266,9 @@ impl Stats {
             format!("synced_seq {}", self.synced_seq),
             format!("fsync {}", self.fsync),
             format!("compacting {}", self.compacting),
+            format!("recovery_corrupt_records {}", self.recovery_corrupt_records),
+            format!("recovery_corrupt_bytes {}", self.recovery_corrupt_bytes),
+            format!("recovery_truncated_tails {}", self.recovery_truncated_tails),
         ]
     }
 }
@@ -306,25 +379,49 @@ impl Db {
         let mut next_seq = 1u64;
         let mut total = 0u64;
 
+        let mut report = RecoveryReport { segments: ids.len() as u64, ..Default::default() };
+        // Todo lo destructivo se aplaza hasta saber si hay corrupción: en modo
+        // estricto no se modifica ni un byte de los datos del usuario.
+        let mut pending_truncate: Vec<(PathBuf, Arc<File>, u64)> = Vec::new();
+        let mut corruptos_en: Vec<u32> = Vec::new();
+
         for &id in &ids {
             let path = seg_path(&opts.dir, id);
-            let file = open_segment(&opts.dir, id)?;
+            let file = Arc::new(open_segment(&opts.dir, id)?);
             let mut len = file.metadata()?.len();
-            let mut rd = SegmentReader::new(BufReader::with_capacity(1 << 16, file.try_clone()?), len);
+            let mut rd =
+                SegmentReader::new(BufReader::with_capacity(1 << 16, file.try_clone()?), len);
             loop {
                 match rd.next()? {
                     ReadOutcome::End => break,
-                    ReadOutcome::Torn { at } => {
-                        eprintln!(
-                            "bitacora: {} tiene un registro incompleto en el byte {at} (escritura a medias); se recorta",
-                            path.display()
-                        );
-                        file.set_len(at)?;
-                        file.sync_all()?;
+                    ReadOutcome::IncompleteTail { at, cause } => {
+                        report.truncated_tails.push((path.clone(), at));
+                        report.detalle.push(format!(
+                            "{}: cola de escritura incompleta en el byte {at} ({}); se recortan {} byte(s) nunca confirmados",
+                            path.display(),
+                            cause.name(),
+                            len - at
+                        ));
+                        pending_truncate.push((path.clone(), Arc::clone(&file), at));
                         len = at;
                         break;
                     }
+                    ReadOutcome::Corrupt { at, resync_at, cause, por_cabecera } => {
+                        report.corrupt_records += 1;
+                        report.corrupt_bytes += resync_at - at;
+                        if !corruptos_en.contains(&id) {
+                            corruptos_en.push(id);
+                        }
+                        report.detalle.push(format!(
+                            "{}: CORRUPCIÓN en los bytes {at}..{resync_at} ({}); sincronismo recuperado {}; los registros posteriores se conservan",
+                            path.display(),
+                            cause.name(),
+                            if por_cabecera { "por la cabecera" } else { "rastreando byte a byte" }
+                        ));
+                        continue;
+                    }
                     ReadOutcome::Record(r) => {
+                        report.records_ok += 1;
                         if r.seq >= next_seq {
                             next_seq = r.seq + 1;
                         }
@@ -346,7 +443,65 @@ impl Db {
                 }
             }
             total += len;
-            segments.insert(id, Arc::new(file));
+            segments.insert(id, file);
+        }
+
+        // La corrupción no se trata nunca como un incidente menor.
+        if !corruptos_en.is_empty() {
+            match opts.recovery {
+                RecoveryPolicy::Estricto => {
+                    let mut msg = format!(
+                        "recuperación abortada: {} zona(s) ilegible(s), {} byte(s), en {} segmento(s). \
+                         NO se ha modificado ningún fichero.\n",
+                        report.corrupt_records,
+                        report.corrupt_bytes,
+                        corruptos_en.len()
+                    );
+                    for d in &report.detalle {
+                        msg.push_str("  - ");
+                        msg.push_str(d);
+                        msg.push('\n');
+                    }
+                    msg.push_str(
+                        "  Para abrir saltándose lo ilegible (copiando antes cada segmento afectado): --recuperacion reparar",
+                    );
+                    return Err(io::Error::other(msg));
+                }
+                RecoveryPolicy::Reparar => {
+                    let ts = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    // Preservar el original ANTES de cualquier cambio.
+                    for id in &corruptos_en {
+                        let src = seg_path(&opts.dir, *id);
+                        let dst = opts.dir.join(format!("{id:06}.log.corrupto-{ts}"));
+                        fs::copy(&src, &dst)?;
+                        report.quarantined.push(dst);
+                    }
+                    eprintln!(
+                        "bitacora: AVISO — recuperación CON PÉRDIDAS: {} zona(s) ilegible(s), {} byte(s). \
+                         Copia previa de {} segmento(s) en .corrupto-{ts}",
+                        report.corrupt_records,
+                        report.corrupt_bytes,
+                        report.quarantined.len()
+                    );
+                    for d in &report.detalle {
+                        eprintln!("bitacora:   - {d}");
+                    }
+                }
+            }
+        }
+
+        // Solo ahora se toca el disco, y solo para quitar colas que nunca se
+        // confirmaron a ningún cliente.
+        for (path, file, at) in pending_truncate {
+            eprintln!(
+                "bitacora: {} acaba en una escritura incompleta; se recorta en el byte {at}",
+                path.display()
+            );
+            file.set_len(at)?;
+            file.sync_all()?;
         }
 
         // Las lápidas ya han hecho su trabajo: fuera del índice.
@@ -393,6 +548,7 @@ impl Db {
             compacting: AtomicBool::new(false),
             live: AtomicU64::new(live),
             dead: AtomicU64::new(total.saturating_sub(live)),
+            recovery: report,
         });
 
         let syncer = if fsync == FsyncPolicy::Group {
@@ -483,6 +639,13 @@ impl Db {
             return Ok(Some(buf));
         }
         Err(io::Error::new(io::ErrorKind::Other, "segmento desaparecido durante la lectura"))
+    }
+
+    /// Qué pasó al reconstruir el índice al abrir: registros leídos, zonas
+    /// ilegibles saltadas, colas recortadas y copias de seguridad hechas.
+    /// `con_perdidas()` dice si la recuperación fue íntegra o no.
+    pub fn recovery_report(&self) -> &RecoveryReport {
+        &self.inner.recovery
     }
 
     pub fn exists(&self, key: &[u8]) -> bool {
@@ -593,6 +756,9 @@ impl Db {
             synced_seq,
             fsync: inner.opts.fsync.name().to_string(),
             compacting: inner.compacting.load(Ordering::Relaxed),
+            recovery_corrupt_records: inner.recovery.corrupt_records,
+            recovery_corrupt_bytes: inner.recovery.corrupt_bytes,
+            recovery_truncated_tails: inner.recovery.truncated_tails.len() as u64,
         }
     }
 
@@ -757,6 +923,18 @@ impl Inner {
                 }
                 let r = match rd.next()? {
                     ReadOutcome::Record(r) => r,
+                    ReadOutcome::Corrupt { at, cause, .. } => {
+                        // Integridad antes que rendimiento. Si un segmento se
+                        // ha corrompido con el proceso en marcha, se abandona
+                        // la compactación: nunca se borra un segmento del que
+                        // no se ha podido copiar todo lo vivo.
+                        return Err(io::Error::other(format!(
+                            "compactación abandonada: {} tiene datos ilegibles en el byte {at} ({}). \
+                             No se ha borrado ningún segmento",
+                            path.display(),
+                            cause.name()
+                        )));
+                    }
                     _ => break,
                 };
                 if r.kind == Kind::Del {

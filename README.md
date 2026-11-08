@@ -76,19 +76,20 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
-STATS                      → STATS 10  /  keys 0 / segments 1 / … / synced_seq 3
+STATS                      → STATS 13  /  keys 0 / segments 1 / … / synced_seq 3
 COMPACT                    → OK segmentos_retirados=1 bytes_antes=132 bytes_despues=68
 PING                       → PONG
 QUIT                       → BYE
 ```
 
 `serve` options: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
-`--fullfsync`, `--segment-mb` (size of each log file), `--max-conns`.
+`--fullfsync`, `--segment-mb` (size of each log file), `--max-conns`,
+`--recuperacion estricto|reparar`.
 
 Tests and benchmark:
 
 ```bash
-cargo test                                   # 17 tests (unit + integration)
+cargo test                                   # 33 tests (unit + integration)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -210,14 +211,45 @@ src/main.rs      serve / cli / bench
 tests/           recovery (kill -9, torn tail, flipped bit) and concurrency
 ```
 
-## Tests (17)
+## Corruption is not the same as a torn tail
+
+A record that fails its checks means one of two very different things, and
+conflating them costs data:
+
+* **Torn tail** — the file ends in a half-written record and **nothing valid
+  follows**. That is what a power cut leaves behind; truncating there loses
+  nothing that was ever acknowledged.
+* **Corruption** — a record fails to validate but **valid records follow it**.
+  Truncating here would destroy acknowledged data, so the reader resynchronises
+  and keeps everything after it.
+
+Until 8 November 2026 this engine did not make that distinction, and a single
+flipped bit 40% into a segment destroyed 30 of 50 keys *and* truncated the file
+from 2,530 to 1,000 bytes. On corruption, recovery now has two modes:
+
+| `--recuperacion` | Behaviour |
+|---|---|
+| `estricto` (default) | **Refuses to open and modifies no byte.** The error names the file, offset, byte count and cause |
+| `reparar` | Opens, skipping unreadable regions, after copying every affected segment to `NNNNNN.log.corrupto-<epoch>`; reports exactly what was lost |
+
+`STATS` publishes `recovery_corrupt_records`, `recovery_corrupt_bytes` and
+`recovery_truncated_tails`, so a lossy recovery is never presented as a clean
+one. Guarantees per operation, and the ten explicit limits of what recovery
+cannot do, are in [docs/RECUPERACION.md](docs/RECUPERACION.md).
+
+## Tests (33)
 
 * `crc32`: standard vector, chunked computation.
 * `wal`: round trip, truncated tail, flipped bit.
 * `protocol`: parsing and errors.
-* Recovery: a **real `kill -9`** mid-write (×3), torn tail truncated, a corrupt bit
-  discarding only that record, deletes + compaction + restart, binary keys and values,
-  and size limits.
+* Recovery: a **real `kill -9`** mid-write (×3), torn tail truncated, deletes +
+  compaction + restart, binary keys and values, and size limits.
+* Corruption (`tests/corrupcion.rs`, 10 tests): a flipped bit at the start, the
+  middle and three quarters of a segment; two corruptions in one segment; a
+  wrecked header; a mid-file truncation; a segment of pure garbage. Each one
+  asserts that the **valid records after the damage survive**, that strict mode
+  refuses to open and leaves the file byte-identical, and that repair mode
+  quarantines the original first.
 * Concurrency: 8 threads × 3,000 writes with interleaved reads and a restart, one hot
   key from 8 threads staying consistent with the log, compaction while reading and
   writing, group commit with 16 threads (`synced_seq == last_seq` at the end).

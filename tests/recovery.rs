@@ -75,8 +75,12 @@ fn cola_rota_se_recorta_y_lo_demas_sobrevive() {
     assert_eq!(std::fs::metadata(&path).unwrap().len(), len_ok, "la cola rota debe recortarse");
 }
 
+/// Un bit corrupto **en el último registro del fichero**. Es el único caso en
+/// que recortar la cola no pierde nada, porque no hay registros válidos
+/// detrás. La corrupción en cualquier otra posición se cubre en
+/// `tests/corrupcion.rs`: esta prueba, sola, daba confianza falsa.
 #[test]
-fn un_bit_corrupto_descarta_solo_ese_registro() {
+fn un_bit_corrupto_en_el_ultimo_registro_descarta_solo_ese_registro() {
     let tmp = TempDir::new("bitflip");
     {
         let db = Db::open(opts(tmp.path())).unwrap();

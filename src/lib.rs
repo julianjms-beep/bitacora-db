@@ -12,7 +12,9 @@ pub mod server;
 pub mod store;
 pub mod wal;
 
-pub use store::{CompactReport, Db, FsyncPolicy, Options, Stats};
+pub use store::{
+    CompactReport, Db, FsyncPolicy, Options, RecoveryPolicy, RecoveryReport, Stats,
+};
 
 /// Valor determinista para la clave `k{i}`; lo usan la prueba de apagón y el bench.
 pub fn demo_value(i: u64) -> Vec<u8> {

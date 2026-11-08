@@ -1,5 +1,5 @@
 use bitacora::server::{serve, ServerConfig};
-use bitacora::{demo_value, Db, FsyncPolicy, Options};
+use bitacora::{demo_value, Db, FsyncPolicy, Options, RecoveryPolicy};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -30,6 +30,14 @@ fn usage() {
 USO
   bitacora serve [--dir data] [--host 127.0.0.1] [--port 7379] [--fsync group|always|never]
                  [--fullfsync] [--segment-mb 64] [--max-conns 1024]
+                 [--recuperacion estricto|reparar]
+
+  --recuperacion estricto (por defecto): si el WAL tiene corrupción, NO abre y no
+                 modifica ningún fichero. Una recuperación incompleta nunca se
+                 presenta como satisfactoria.
+  --recuperacion reparar: abre saltándose los registros ilegibles, tras copiar
+                 cada segmento afectado a NNNNNN.log.corrupto-<epoch>, e informa
+                 de cuántos registros y bytes se perdieron.
   bitacora cli   [--host 127.0.0.1] [--port 7379]
   bitacora bench [--threads 8] [--ops 200000] [--value-bytes 100] [--fsync never|group|always]
                  [--dir /tmp]"
@@ -68,6 +76,16 @@ fn cmd_serve(args: &[String]) -> i32 {
     };
     opts.full_fsync = has(args, "--fullfsync");
     opts.max_segment_bytes = opt_or::<u64>(args, "--segment-mb", 64) << 20;
+    opts.recovery = match opt(args, "--recuperacion") {
+        None => RecoveryPolicy::Estricto,
+        Some(s) => match RecoveryPolicy::parse(&s) {
+            Some(p) => p,
+            None => {
+                eprintln!("--recuperacion inválido: {s} (estricto|reparar)");
+                return 2;
+            }
+        },
+    };
     let cfg = ServerConfig {
         host: opt(args, "--host").unwrap_or_else(|| "127.0.0.1".into()),
         port: opt_or(args, "--port", 7379),
@@ -82,9 +100,13 @@ fn cmd_serve(args: &[String]) -> i32 {
         }
     };
     let st = db.stats();
+    // Una recuperación con pérdidas no se presenta nunca como satisfactoria.
+    let rep = db.recovery_report();
+    let aviso = if rep.con_perdidas() { " (RECUPERACIÓN CON PÉRDIDAS)" } else { "" };
     eprintln!(
-        "bitacora: {} claves recuperadas de {} segmento(s) ({} bytes) en {:.1} ms · fsync={} · dir={}",
+        "bitacora: {} claves{} recuperadas de {} segmento(s) ({} bytes) en {:.1} ms · fsync={} · dir={}",
         st.keys,
+        aviso,
         st.segments,
         st.disk_bytes,
         t0.elapsed().as_secs_f64() * 1000.0,

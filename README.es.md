@@ -42,19 +42,20 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
-STATS                      → STATS 10  /  keys 0 / segments 1 / ... / synced_seq 3
+STATS                      → STATS 13  /  keys 0 / segments 1 / ... / synced_seq 3
 COMPACT                    → OK segmentos_retirados=1 bytes_antes=132 bytes_despues=68
 PING                       → PONG
 QUIT                       → BYE
 ```
 
 Opciones de `serve`: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
-`--fullfsync`, `--segment-mb` (tamaño de cada fichero de log), `--max-conns`.
+`--fullfsync`, `--segment-mb` (tamaño de cada fichero de log), `--max-conns`,
+`--recuperacion estricto|reparar`.
 
 Pruebas y benchmark:
 
 ```bash
-cargo test                                   # 17 pruebas (unitarias + integración)
+cargo test                                   # 33 pruebas (unitarias + integración)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -180,14 +181,46 @@ src/main.rs      serve / cli / bench
 tests/           recuperación (kill -9, cola rota, bit corrupto) y concurrencia
 ```
 
-## Pruebas (17)
+## Corrupción y cola incompleta no son lo mismo
+
+Un registro que no pasa las comprobaciones puede significar dos cosas muy
+distintas, y confundirlas cuesta datos:
+
+* **Cola incompleta**: el fichero acaba en un registro a medio escribir y **no
+  hay nada válido detrás**. Es lo que deja un apagón, y recortar ahí no pierde
+  nada que se hubiera confirmado.
+* **Corrupción**: un registro no valida pero **sí hay registros válidos
+  detrás**. Recortar aquí destruiría datos confirmados, así que el lector
+  resincroniza y conserva todo lo posterior.
+
+Hasta el 8 de noviembre de 2026 el motor no hacía esa distinción, y un solo bit
+volteado al 40% de un segmento destruía 30 de 50 claves **y** recortaba el
+fichero de 2.530 a 1.000 bytes. Ante corrupción hay ahora dos modos:
+
+| `--recuperacion` | Comportamiento |
+|---|---|
+| `estricto` (por defecto) | **No abre y no modifica ni un byte.** El error dice fichero, desplazamiento, bytes y causa |
+| `reparar` | Abre saltándose lo ilegible, tras copiar cada segmento afectado a `NNNNNN.log.corrupto-<epoch>`; informa de lo que se perdió |
+
+`STATS` publica `recovery_corrupt_records`, `recovery_corrupt_bytes` y
+`recovery_truncated_tails`, así que una recuperación con pérdidas nunca se
+presenta como íntegra. Las garantías de cada operación y los diez límites
+explícitos de lo que la recuperación **no** puede hacer están en
+[docs/RECUPERACION.md](docs/RECUPERACION.md).
+
+## Pruebas (33)
 
 * `crc32`: vector estándar, cálculo por trozos.
 * `wal`: ida y vuelta, cola cortada, bit cambiado.
 * `protocol`: parseo y errores.
-* Recuperación: **`kill -9` real** a mitad de escritura (×3), cola rota se
-  recorta, un bit corrupto descarta solo ese registro, borrados + compactación +
-  reinicio, claves/valores binarios y límites.
+* Recuperación: **`kill -9` real** a mitad de escritura (×3), la cola rota se
+  recorta, borrados + compactación + reinicio, claves/valores binarios y límites.
+* Corrupción (`tests/corrupcion.rs`, 10 pruebas): un bit volteado al principio,
+  en el medio y en tres cuartos del segmento; dos corrupciones en el mismo
+  segmento; una cabecera destrozada; un truncamiento por el medio; un segmento
+  de basura entera. Cada una comprueba que **los registros válidos posteriores
+  sobreviven**, que el modo estricto se niega a abrir dejando el fichero
+  idéntico byte a byte, y que el modo reparar deja copia del original.
 * Concurrencia: 8 hilos × 3.000 escrituras con lecturas cruzadas y reinicio,
   clave caliente desde 8 hilos coherente con el log, compactación mientras se
   escribe y se lee, group commit con 16 hilos (`synced_seq == last_seq` al final).
