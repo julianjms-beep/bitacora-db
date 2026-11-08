@@ -1,0 +1,15 @@
+target/
+data/
+*.log
+
+# --- secretos (añadido 08-11-2026) ---
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p8
+*.p12
+credentials.json
+service-account*.json
