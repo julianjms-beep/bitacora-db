@@ -137,11 +137,13 @@ implementación.
    índice puede apuntar mal y no hay checksum que lo cace.
 9. **No hay comprobación proactiva.** No existe un «fregado» en segundo plano que
    recorra los segmentos buscando bits podridos antes de que un cliente los pida.
-10. **Probado con bits volteados a mano, en macOS/arm64.** No se ha probado con
-    fallos reales de disco, ni en Linux, ni con inyección de fallos de E/S a
-    nivel de sistema de ficheros. El fallo de `fsync` sí se prueba, pero con un
-    error inyectado desde el propio motor (`Options::fsync_falla_tras`), no con
-    un disco que falle de verdad.
+10. **Probado con bits volteados a mano y con fallos inyectados, no con discos
+    que fallen de verdad.** La suite corre en Linux y en macOS (CI), así que las
+    dos ramas de `sync_fd` se ejercitan. Lo que **no** se ha probado: fallos
+    reales de disco, inyección de fallos a nivel de sistema de ficheros, y
+    cortes de corriente de verdad. El fallo de `fsync` se prueba con un error
+    inyectado desde el propio motor (`Options::fsync_falla_tras`), lo que valida
+    la lógica de reacción pero no el comportamiento del hardware.
 11. **El `fsync` del directorio no es verificable por prueba.** Crear y borrar
     segmentos sincroniza ahora el directorio que los contiene, porque en POSIX
     el nombre de un fichero no es durable sin eso. Pero un `fsync` no se puede
