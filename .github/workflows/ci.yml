@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  calidad:
+    name: Formato y clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      - name: rustfmt
+        run: cargo fmt --check
+      # Sin avisos, no "con pocos avisos": si se permite uno, se permiten diez.
+      - name: clippy sin avisos
+        run: cargo clippy --all-targets -- -D warnings
+
+  pruebas:
+    name: Pruebas en ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Que un sistema falle no debe ocultar el resultado del otro.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --all-targets
+
+      # El motor se desarrolló en macOS, así que Linux ejercita caminos que en
+      # local no se compilan siquiera: la variante no-macOS de `sync_fd` y el
+      # `sync_all` del directorio. Ahí ya se escondió un error de tipos.
+      - name: Pruebas
+        run: cargo test --release
+
+      - name: Pruebas en un solo hilo (orden de ejecución distinto)
+        run: cargo test --release -- --test-threads=1
+
+      # Las pruebas por propiedades usan semilla fija para ser reproducibles.
+      # Aquí se les da una franja distinta en cada ejecución, así que la CI va
+      # explorando el espacio en vez de repetir siempre los mismos 965 casos.
+      # Si falla, el registro trae la semilla y el número de iteración, y se
+      # reproduce con: BITACORA_SEMILLA=<n> cargo test --test propiedades
+      - name: Barrido aleatorio (franja ${{ github.run_number }})
+        run: cargo test --release --test propiedades
+        env:
+          BITACORA_SEMILLA: ${{ github.run_number }}
+          BITACORA_ITERS: 10

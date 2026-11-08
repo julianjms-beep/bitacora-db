@@ -7,8 +7,14 @@ pub struct TempDir(pub PathBuf);
 
 impl TempDir {
     pub fn new(tag: &str) -> Self {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let p = std::env::temp_dir().join(format!("bitacora-test-{tag}-{}-{nanos}", std::process::id()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!(
+            "bitacora-test-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         TempDir(p)
     }
@@ -29,7 +35,7 @@ pub fn segments(dir: &Path) -> Vec<(PathBuf, u64)> {
     let mut v: Vec<(PathBuf, u64)> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().map_or(false, |x| x == "log"))
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
         .map(|p| {
             let len = std::fs::metadata(&p).unwrap().len();
             (p, len)

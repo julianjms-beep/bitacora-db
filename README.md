@@ -89,7 +89,7 @@ QUIT                       → BYE
 Tests and benchmark:
 
 ```bash
-cargo test                                   # 55 tests (unit + integration)
+cargo test                                   # 59 tests (unit + integration)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -289,7 +289,21 @@ place, and what it prevents:
 `AUTH` takes a shared secret, compared in constant time, from `--clave` or the
 `BITACORA_CLAVE` environment variable so it does not sit in the process list.
 
-## Tests (55)
+## How this is kept honest
+
+CI runs on every push, on **both Linux and macOS**: `cargo fmt --check`,
+`clippy --all-targets -- -D warnings` (no warnings, not "few warnings"), the
+full suite, and the suite again single-threaded so test interdependence shows
+up. The cross-platform job earns its place — the engine was written on macOS,
+and the Linux job compiles the `#[cfg(not(target_os = "macos"))]` paths that
+never build locally. A type error was hiding in exactly one of them.
+
+The property tests use a fixed seed so `cargo test` is reproducible, and CI
+passes `BITACORA_SEMILLA=<run number>` so every run explores a different slice
+of the random space instead of re-checking the same 965 cases. A failure prints
+its seed and iteration, so it replays exactly.
+
+## Tests (59)
 
 * `crc32`: standard vector, chunked computation.
 * `wal`: round trip, truncated tail, flipped bit.
@@ -305,6 +319,12 @@ place, and what it prevents:
 * Concurrency: 8 threads × 3,000 writes with interleaved reads and a restart, one hot
   key from 8 threads staying consistent with the log, compaction while reading and
   writing, group commit with 16 threads (`synced_seq == last_seq` at the end).
+* Properties and random sweep (`tests/propiedades.rs`, 4 tests): every record
+  round-trips identically; the reader never panics on arbitrary bytes **and
+  always advances** (without that, resynchronisation could loop forever);
+  recovery never *fabricates* data, only loses it; and the engine matches a
+  `HashMap` model across a random operation sequence, before and after restart.
+  48,000 cases across five seeds have been run by hand on top of CI.
 * Server hardening (`tests/servidor.rs`, 8 tests): operating before `AUTH`,
   a wrong key, refusing to bind off-localhost without one, the `KEYS` cap and
   its ordering, values with newlines in both directions, the response size cap,

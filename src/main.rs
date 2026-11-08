@@ -66,7 +66,9 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 }
 
 fn opt_or<T: FromStr>(args: &[String], name: &str, default: T) -> T {
-    opt(args, name).and_then(|s| s.parse().ok()).unwrap_or(default)
+    opt(args, name)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn has(args: &[String], name: &str) -> bool {
@@ -76,7 +78,9 @@ fn has(args: &[String], name: &str) -> bool {
 fn fsync_opt(args: &[String], default: FsyncPolicy) -> Result<FsyncPolicy, String> {
     match opt(args, "--fsync") {
         None => Ok(default),
-        Some(s) => FsyncPolicy::parse(&s).ok_or(format!("--fsync inválido: {s} (group|always|never)")),
+        Some(s) => {
+            FsyncPolicy::parse(&s).ok_or(format!("--fsync inválido: {s} (group|always|never)"))
+        }
     }
 }
 
@@ -111,7 +115,13 @@ fn cmd_serve(args: &[String]) -> i32 {
     cfg.permitir_sin_clave = has(args, "--sin-clave");
     // La clave puede venir del entorno para no dejarla en la lista de procesos.
     cfg.clave = opt(args, "--clave").or_else(|| std::env::var("BITACORA_CLAVE").ok());
-    let segundos = |n: u64| if n == 0 { None } else { Some(Duration::from_secs(n)) };
+    let segundos = |n: u64| {
+        if n == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(n))
+        }
+    };
     cfg.read_timeout = segundos(opt_or(args, "--timeout-lectura", 300));
     cfg.write_timeout = segundos(opt_or(args, "--timeout-escritura", 60));
     // M3: SIGINT y SIGTERM pasan a pedir un apagado ordenado.
@@ -127,7 +137,11 @@ fn cmd_serve(args: &[String]) -> i32 {
     let st = db.stats();
     // Una recuperación con pérdidas no se presenta nunca como satisfactoria.
     let rep = db.recovery_report();
-    let aviso = if rep.con_perdidas() { " (RECUPERACIÓN CON PÉRDIDAS)" } else { "" };
+    let aviso = if rep.con_perdidas() {
+        " (RECUPERACIÓN CON PÉRDIDAS)"
+    } else {
+        ""
+    };
     eprintln!(
         "bitacora: {} claves{} recuperadas de {} segmento(s) ({} bytes) en {:.1} ms · fsync={} · dir={}",
         st.keys,
@@ -168,7 +182,9 @@ fn cmd_cli(args: &[String]) -> i32 {
     let mut wr = stream;
     let stdin = io::stdin();
     let mut out = io::stdout();
-    eprintln!("conectado a {host}:{port}. Órdenes: SET GET DEL EXISTS KEYS STATS COMPACT PING QUIT");
+    eprintln!(
+        "conectado a {host}:{port}. Órdenes: SET GET DEL EXISTS KEYS STATS COMPACT PING QUIT"
+    );
     loop {
         print!("bitacora> ");
         let _ = out.flush();
@@ -218,8 +234,13 @@ fn cmd_bench(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let base = PathBuf::from(opt(args, "--dir").unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned()));
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let base = PathBuf::from(
+        opt(args, "--dir").unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned()),
+    );
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = base.join(format!("bitacora-bench-{}-{nanos}", std::process::id()));
 
     let mut opts = Options::new(&dir);
@@ -229,7 +250,10 @@ fn cmd_bench(args: &[String]) -> i32 {
     let per = ops / threads as u64;
     let value = vec![b'x'; vbytes];
 
-    println!("bitacora bench · {threads} hilos · {ops} ops · valor {vbytes} B · fsync={}", fsync.name());
+    println!(
+        "bitacora bench · {threads} hilos · {ops} ops · valor {vbytes} B · fsync={}",
+        fsync.name()
+    );
 
     let t0 = Instant::now();
     let hs: Vec<_> = (0..threads as u64)
@@ -325,7 +349,7 @@ fn cmd_crashwrite(args: &[String]) -> i32 {
         let key = format!("k{i}");
         db.put(key.as_bytes(), &demo_value(i)).expect("put");
         i += 1;
-        if i % 50_000 == 0 {
+        if i.is_multiple_of(50_000) {
             thread::sleep(Duration::from_micros(1));
         }
     }

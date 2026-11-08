@@ -46,7 +46,10 @@ fn fsync_fallido_no_adelanta_la_marca_ni_se_declara_exito() {
     db.put(b"c", b"3").unwrap();
     let st_ok = db.stats();
     assert_eq!(st_ok.health, "ok");
-    assert_eq!(st_ok.synced_seq, st_ok.last_seq, "sin fallos, todo está en disco");
+    assert_eq!(
+        st_ok.synced_seq, st_ok.last_seq,
+        "sin fallos, todo está en disco"
+    );
 
     // El cuarto falla: el cliente se tiene que enterar.
     let e = match db.put(b"d", b"4") {
@@ -68,10 +71,17 @@ fn fsync_fallido_no_adelanta_la_marca_ni_se_declara_exito() {
         st.synced_seq,
         st.last_seq
     );
-    assert!(st.health.starts_with("no-escribible"), "health: {}", st.health);
+    assert!(
+        st.health.starts_with("no-escribible"),
+        "health: {}",
+        st.health
+    );
 
     // A partir de aquí no se acepta ninguna escritura más.
-    assert!(db.put(b"e", b"5").is_err(), "no debe aceptar más escrituras");
+    assert!(
+        db.put(b"e", b"5").is_err(),
+        "no debe aceptar más escrituras"
+    );
     assert!(db.delete(b"a").is_err(), "tampoco borrados");
 
     // Pero leer sigue funcionando: lo que estaba confirmado, está.
@@ -171,12 +181,18 @@ fn fallo_al_cerrar_segmento_tambien_deja_la_base_no_escribible() {
     // Con fsync=never los put no sincronizan; el primer fsync llega al rodar.
     let mut fallo = false;
     for i in 0..60u64 {
-        if db.put(format!("k{i}").as_bytes(), b"valor-de-relleno").is_err() {
+        if db
+            .put(format!("k{i}").as_bytes(), b"valor-de-relleno")
+            .is_err()
+        {
             fallo = true;
             break;
         }
     }
-    assert!(fallo, "al cerrar un segmento el fsync debía fallar y propagarse");
+    assert!(
+        fallo,
+        "al cerrar un segmento el fsync debía fallar y propagarse"
+    );
     assert!(db.stats().health.starts_with("no-escribible"));
 }
 
@@ -198,12 +214,18 @@ fn el_ciclo_de_vida_de_los_segmentos_sigue_funcionando() {
         let db = Db::open(o.clone()).unwrap();
         for ronda in 0..10u64 {
             for i in 0..50u64 {
-                db.put(format!("k{i}").as_bytes(), format!("r{ronda}-{i}").as_bytes())
-                    .unwrap();
+                db.put(
+                    format!("k{i}").as_bytes(),
+                    format!("r{ronda}-{i}").as_bytes(),
+                )
+                .unwrap();
             }
         }
         let rep = db.compact().unwrap();
-        assert!(rep.ran && rep.segments_removed > 0, "la compactación debía retirar segmentos");
+        assert!(
+            rep.ran && rep.segments_removed > 0,
+            "la compactación debía retirar segmentos"
+        );
         assert_eq!(db.len(), 50);
     }
     let db = Db::open(o).unwrap();

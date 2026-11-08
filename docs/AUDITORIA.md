@@ -27,10 +27,15 @@ M3, M4, M5, M6 y M8**, más una fuga de conexiones que no estaba en este informe
 (un hilo que entraba en panic nunca decrementaba el contador). Pruebas: 17 al
 auditar, **55** ahora.
 
+Resueltos también **B3** en el Gate 4: CI en Linux y macOS con `cargo fmt
+--check` y `clippy -D warnings`, rustfmt aplicado a todo el código y clippy sin
+un solo aviso. Pruebas: 17 al auditar, **59** ahora, incluidas property-based y
+un barrido aleatorio del lector del WAL.
+
 Pendientes: **M7** (`KEYS`, `len()` y `stats()` no son instantáneas coherentes;
 documentado, no arreglado), **M9** (CRC32 no detecta manipulación; documentado
-como límite de seguridad), **B1**, **B2** y **B3** (sin CI, sin property-based,
-sin fuzzing, 0 doc-tests). Los límites de recuperación que el formato actual no
+como límite de seguridad), **B1**, **B2**, y de B3 queda la documentación de API
+publicada (0 doc-tests). Los límites de recuperación que el formato actual no
 permite salvar están en `docs/RECUPERACION.md`.
 
 ## Resumen

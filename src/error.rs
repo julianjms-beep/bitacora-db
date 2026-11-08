@@ -143,6 +143,8 @@ mod tests {
         assert!(Error::NoEscribible("el disco".into())
             .to_string()
             .contains("NO ESCRIBIBLE"));
-        assert!(Error::Invalida("clave vacía").to_string().contains("inválida"));
+        assert!(Error::Invalida("clave vacía")
+            .to_string()
+            .contains("inválida"));
     }
 }

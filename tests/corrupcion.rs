@@ -34,8 +34,11 @@ fn opts(dir: &Path, pol: RecoveryPolicy) -> Options {
 fn crea(dir: &Path, n: u64) {
     let db = Db::open(opts(dir, RecoveryPolicy::Estricto)).unwrap();
     for i in 0..n {
-        db.put(format!("k{i}").as_bytes(), format!("valor-de-la-clave-{i}").as_bytes())
-            .unwrap();
+        db.put(
+            format!("k{i}").as_bytes(),
+            format!("valor-de-la-clave-{i}").as_bytes(),
+        )
+        .unwrap();
     }
     drop(db);
 }
@@ -94,10 +97,19 @@ fn fallo_original_estricto_se_niega_y_no_toca_el_fichero() {
         "categoría equivocada: {} ({e})",
         e.categoria()
     );
-    assert!(!e.reintentable(), "la corrupción necesita intervención humana");
+    assert!(
+        !e.reintentable(),
+        "la corrupción necesita intervención humana"
+    );
     let msg = e.to_string();
-    assert!(msg.contains("recuperación abortada"), "mensaje inesperado: {msg}");
-    assert!(msg.contains("NO se ha modificado ningún fichero"), "mensaje inesperado: {msg}");
+    assert!(
+        msg.contains("recuperación abortada"),
+        "mensaje inesperado: {msg}"
+    );
+    assert!(
+        msg.contains("NO se ha modificado ningún fichero"),
+        "mensaje inesperado: {msg}"
+    );
 
     let despues = std::fs::read(&path).unwrap();
     assert_eq!(
@@ -119,22 +131,37 @@ fn fallo_original_reparar_conserva_lo_posterior() {
 
     let db = Db::open(opts(tmp.path(), RecoveryPolicy::Reparar)).unwrap();
     let rep = db.recovery_report();
-    assert!(rep.con_perdidas(), "la recuperación NO fue íntegra y debe decirlo");
+    assert!(
+        rep.con_perdidas(),
+        "la recuperación NO fue íntegra y debe decirlo"
+    );
     assert_eq!(rep.corrupt_records, 1, "una sola zona ilegible");
     assert!(rep.corrupt_bytes > 0);
 
     // 49 de 50: antes del arreglo quedaban 20.
-    assert_eq!(supervivientes(&db, 50), 49, "solo debe perderse el registro corrupto");
+    assert_eq!(
+        supervivientes(&db, 50),
+        49,
+        "solo debe perderse el registro corrupto"
+    );
 
     // El original se preserva y el fichero de datos no se recorta.
-    assert_eq!(rep.quarantined.len(), 1, "debe haber una copia de seguridad");
+    assert_eq!(
+        rep.quarantined.len(),
+        1,
+        "debe haber una copia de seguridad"
+    );
     assert!(rep.quarantined[0].exists());
     assert_eq!(
         std::fs::metadata(&rep.quarantined[0]).unwrap().len(),
         bytes_antes,
         "la copia debe ser del fichero completo"
     );
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes_antes, "no se recorta nada");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        bytes_antes,
+        "no se recorta nada"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -189,10 +216,16 @@ fn corrupcion_en_el_ultimo_registro_es_cola_incompleta() {
     // No hace falta modo reparar: una cola incompleta es el caso normal.
     let db = Db::open(opts(tmp.path(), RecoveryPolicy::Estricto)).unwrap();
     let rep = db.recovery_report();
-    assert!(!rep.con_perdidas(), "una cola incompleta no es pérdida de datos confirmados");
+    assert!(
+        !rep.con_perdidas(),
+        "una cola incompleta no es pérdida de datos confirmados"
+    );
     assert_eq!(rep.truncated_tails.len(), 1);
     assert_eq!(supervivientes(&db, 30), 29);
-    assert!(std::fs::metadata(&path).unwrap().len() < len, "la cola debe recortarse");
+    assert!(
+        std::fs::metadata(&path).unwrap().len() < len,
+        "la cola debe recortarse"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -243,9 +276,15 @@ fn truncamiento_por_el_medio_es_cola_incompleta() {
 
     let db = Db::open(opts(tmp.path(), RecoveryPolicy::Estricto)).unwrap();
     let rep = db.recovery_report();
-    assert!(!rep.con_perdidas(), "un truncamiento no es corrupción intermedia");
+    assert!(
+        !rep.con_perdidas(),
+        "un truncamiento no es corrupción intermedia"
+    );
     let vivas = supervivientes(&db, 40);
-    assert!(vivas > 0 && vivas < 40, "debe sobrevivir el prefijo: {vivas}");
+    assert!(
+        vivas > 0 && vivas < 40,
+        "debe sobrevivir el prefijo: {vivas}"
+    );
     // Y lo que sobrevive es un prefijo exacto, sin huecos.
     for i in 0..vivas {
         assert!(
@@ -267,7 +306,11 @@ fn segmento_de_basura_no_se_declara_recuperado() {
     std::fs::write(&path, &basura).unwrap();
 
     let db = Db::open(opts(tmp.path(), RecoveryPolicy::Estricto)).unwrap();
-    assert_eq!(supervivientes(&db, 10), 0, "no debe inventarse ninguna clave");
+    assert_eq!(
+        supervivientes(&db, 10),
+        0,
+        "no debe inventarse ninguna clave"
+    );
     assert_eq!(db.recovery_report().truncated_tails.len(), 1);
 }
 

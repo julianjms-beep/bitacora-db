@@ -118,7 +118,10 @@ pub enum ReadOutcome {
     /// El fichero acaba en un registro a medio escribir y no hay nada válido
     /// detrás: escritura interrumpida por un apagón. Recortar en `at` es
     /// seguro.
-    IncompleteTail { at: u64, cause: Cause },
+    IncompleteTail {
+        at: u64,
+        cause: Cause,
+    },
     /// Un registro no valida pero hay registros válidos detrás. **Recortar
     /// aquí destruiría datos confirmados.** El lector continúa en `resync_at`.
     Corrupt {
@@ -180,7 +183,12 @@ pub struct SegmentReader<R: BufRead + Seek> {
 
 impl<R: BufRead + Seek> SegmentReader<R> {
     pub fn new(r: R, file_len: u64) -> Self {
-        SegmentReader { r, offset: 0, file_len, needs_seek: false }
+        SegmentReader {
+            r,
+            offset: 0,
+            file_len,
+            needs_seek: false,
+        }
     }
 
     pub fn offset(&self) -> u64 {
@@ -240,9 +248,9 @@ impl<R: BufRead + Seek> SegmentReader<R> {
     /// Devuelve dónde termina.
     fn crc_valido_en(&mut self, off: u64) -> io::Result<Option<u64>> {
         match self.parse_at(off, true)? {
-            Parsed::Ok(r) => {
-                Ok(Some(off + HEADER as u64 + r.key.len() as u64 + r.value.len() as u64))
-            }
+            Parsed::Ok(r) => Ok(Some(
+                off + HEADER as u64 + r.key.len() as u64 + r.value.len() as u64,
+            )),
             Parsed::Bad(_) => Ok(None),
         }
     }
@@ -300,10 +308,12 @@ impl<R: BufRead + Seek> SegmentReader<R> {
         if head.klen == 0 || head.klen > MAX_KEY || head.vlen > MAX_VALUE {
             return Ok(None);
         }
-        Ok(Some(off + HEADER as u64 + head.klen as u64 + head.vlen as u64))
+        Ok(Some(
+            off + HEADER as u64 + head.klen as u64 + head.vlen as u64,
+        ))
     }
 
-    pub fn next(&mut self) -> io::Result<ReadOutcome> {
+    pub fn siguiente(&mut self) -> io::Result<ReadOutcome> {
         let start = self.offset;
         if start >= self.file_len {
             return Ok(ReadOutcome::End);
@@ -322,7 +332,12 @@ impl<R: BufRead + Seek> SegmentReader<R> {
                 match self.resincroniza(start, head_hint)? {
                     Some((resync_at, por_cabecera)) => {
                         self.offset = resync_at;
-                        Ok(ReadOutcome::Corrupt { at: start, resync_at, cause, por_cabecera })
+                        Ok(ReadOutcome::Corrupt {
+                            at: start,
+                            resync_at,
+                            cause,
+                            por_cabecera,
+                        })
                     }
                     None => {
                         self.offset = self.file_len;
@@ -362,7 +377,7 @@ mod tests {
     #[test]
     fn ida_y_vuelta() {
         let mut rd = reader(two_records());
-        match rd.next().unwrap() {
+        match rd.siguiente().unwrap() {
             ReadOutcome::Record(r) => {
                 assert_eq!(r.seq, 1);
                 assert_eq!(r.kind, Kind::Put);
@@ -373,7 +388,7 @@ mod tests {
             }
             _ => panic!("esperaba registro"),
         }
-        match rd.next().unwrap() {
+        match rd.siguiente().unwrap() {
             ReadOutcome::Record(r) => {
                 assert_eq!(r.seq, 2);
                 assert_eq!(r.kind, Kind::Del);
@@ -381,7 +396,7 @@ mod tests {
             }
             _ => panic!("esperaba registro"),
         }
-        assert!(matches!(rd.next().unwrap(), ReadOutcome::End));
+        assert!(matches!(rd.siguiente().unwrap(), ReadOutcome::End));
     }
 
     /// Un registro cortado al final y sin nada detrás es una cola incompleta:
@@ -392,8 +407,8 @@ mod tests {
         let first_len = (HEADER + 4 + 5) as u64;
         buf.truncate(buf.len() - 3);
         let mut rd = reader(buf);
-        assert!(matches!(rd.next().unwrap(), ReadOutcome::Record(_)));
-        match rd.next().unwrap() {
+        assert!(matches!(rd.siguiente().unwrap(), ReadOutcome::Record(_)));
+        match rd.siguiente().unwrap() {
             ReadOutcome::IncompleteTail { at, .. } => assert_eq!(at, first_len),
             _ => panic!("esperaba cola incompleta"),
         }
@@ -407,21 +422,29 @@ mod tests {
         let first_len = (HEADER + 4 + 5) as u64;
         buf[HEADER + 2] ^= 0x40; // un byte de la clave del primer registro
         let mut rd = reader(buf);
-        match rd.next().unwrap() {
-            ReadOutcome::Corrupt { at, resync_at, cause, por_cabecera } => {
+        match rd.siguiente().unwrap() {
+            ReadOutcome::Corrupt {
+                at,
+                resync_at,
+                cause,
+                por_cabecera,
+            } => {
                 assert_eq!(at, 0);
-                assert_eq!(resync_at, first_len, "debe saltar justo al segundo registro");
+                assert_eq!(
+                    resync_at, first_len,
+                    "debe saltar justo al segundo registro"
+                );
                 assert_eq!(cause, Cause::CrcIncorrecto);
                 assert!(por_cabecera, "la cabecera estaba intacta");
             }
             _ => panic!("esperaba corrupción, no cola incompleta"),
         }
         // Y el registro siguiente se lee entero.
-        match rd.next().unwrap() {
+        match rd.siguiente().unwrap() {
             ReadOutcome::Record(r) => assert_eq!(r.key, b"adios"),
             _ => panic!("el segundo registro debe sobrevivir"),
         }
-        assert!(matches!(rd.next().unwrap(), ReadOutcome::End));
+        assert!(matches!(rd.siguiente().unwrap(), ReadOutcome::End));
     }
 
     /// Un byte cambiado en la CABECERA del primer registro: las longitudes ya
@@ -432,14 +455,14 @@ mod tests {
         let first_len = (HEADER + 4 + 5) as u64;
         buf[12] ^= 0x10; // key_len del primer registro
         let mut rd = reader(buf);
-        match rd.next().unwrap() {
+        match rd.siguiente().unwrap() {
             ReadOutcome::Corrupt { at, resync_at, .. } => {
                 assert_eq!(at, 0);
                 assert_eq!(resync_at, first_len);
             }
             _ => panic!("esperaba corrupción"),
         }
-        match rd.next().unwrap() {
+        match rd.siguiente().unwrap() {
             ReadOutcome::Record(r) => assert_eq!(r.key, b"adios"),
             _ => panic!("el segundo registro debe sobrevivir"),
         }
@@ -453,8 +476,8 @@ mod tests {
         let first_len = HEADER + 4 + 5;
         buf[first_len + 2] ^= 0x40;
         let mut rd = reader(buf);
-        assert!(matches!(rd.next().unwrap(), ReadOutcome::Record(_)));
-        match rd.next().unwrap() {
+        assert!(matches!(rd.siguiente().unwrap(), ReadOutcome::Record(_)));
+        match rd.siguiente().unwrap() {
             ReadOutcome::IncompleteTail { at, .. } => assert_eq!(at, first_len as u64),
             _ => panic!("esperaba cola incompleta"),
         }
@@ -474,7 +497,7 @@ mod tests {
         let mut vistas = Vec::new();
         let mut corruptos = 0;
         loop {
-            match rd.next().unwrap() {
+            match rd.siguiente().unwrap() {
                 ReadOutcome::Record(r) => vistas.push(r.key),
                 ReadOutcome::Corrupt { resync_at, .. } => {
                     corruptos += 1;
@@ -495,7 +518,13 @@ mod tests {
         let mut buf = Vec::new();
         let mut cortes = Vec::new();
         for i in 0..5u64 {
-            encode(&mut buf, i + 1, Kind::Put, format!("k{i}").as_bytes(), b"valorvalor");
+            encode(
+                &mut buf,
+                i + 1,
+                Kind::Put,
+                format!("k{i}").as_bytes(),
+                b"valorvalor",
+            );
             cortes.push(buf.len());
         }
         buf[cortes[0] + HEADER + 2] ^= 0x0f; // dentro del registro 2
@@ -504,7 +533,7 @@ mod tests {
         let mut vistas = Vec::new();
         let mut corruptos = 0;
         loop {
-            match rd.next().unwrap() {
+            match rd.siguiente().unwrap() {
                 ReadOutcome::Record(r) => vistas.push(String::from_utf8(r.key).unwrap()),
                 ReadOutcome::Corrupt { .. } => corruptos += 1,
                 ReadOutcome::IncompleteTail { .. } => panic!("no esperaba cola incompleta"),
@@ -521,7 +550,10 @@ mod tests {
     fn basura_entera_no_es_legible() {
         let buf: Vec<u8> = (0..500u32).map(|i| (i % 256) as u8).collect();
         let mut rd = reader(buf);
-        assert!(matches!(rd.next().unwrap(), ReadOutcome::IncompleteTail { at: 0, .. }));
+        assert!(matches!(
+            rd.siguiente().unwrap(),
+            ReadOutcome::IncompleteTail { at: 0, .. }
+        ));
     }
 
     /// Un `kind` desconocido se señala como cabecera inválida, no como CRC.
@@ -531,8 +563,10 @@ mod tests {
         let first_len = (HEADER + 4 + 5) as u64;
         buf[20] = 7;
         let mut rd = reader(buf);
-        match rd.next().unwrap() {
-            ReadOutcome::Corrupt { cause, resync_at, .. } => {
+        match rd.siguiente().unwrap() {
+            ReadOutcome::Corrupt {
+                cause, resync_at, ..
+            } => {
                 assert_eq!(cause, Cause::CabeceraInvalida);
                 assert_eq!(resync_at, first_len);
             }

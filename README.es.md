@@ -55,7 +55,7 @@ Opciones de `serve`: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
 Pruebas y benchmark:
 
 ```bash
-cargo test                                   # 55 pruebas (unitarias + integración)
+cargo test                                   # 59 pruebas (unitarias + integración)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -264,7 +264,22 @@ qué evita cada cosa:
 `--clave` o de la variable `BITACORA_CLAVE` para no dejarlo en la lista de
 procesos.
 
-## Pruebas (55)
+## Cómo se mantiene esto honesto
+
+La CI corre en cada push, en **Linux y macOS**: `cargo fmt --check`,
+`clippy --all-targets -- -D warnings` (sin avisos, no «con pocos avisos»), la
+suite completa, y la suite otra vez en un solo hilo para que se vea si unas
+pruebas dependen de otras. El trabajo en dos sistemas se gana el sitio: el
+motor se escribió en macOS, y el de Linux compila las ramas
+`#[cfg(not(target_os = "macos"))]` que aquí no se compilan nunca. En una de
+ellas había escondido un error de tipos.
+
+Las pruebas por propiedades usan semilla fija para que `cargo test` sea
+reproducible, y la CI les pasa `BITACORA_SEMILLA=<número de ejecución>`, así que
+cada vuelta explora una franja distinta del espacio en vez de repetir los mismos
+965 casos. Un fallo imprime su semilla y su iteración, y se reproduce exacto.
+
+## Pruebas (59)
 
 * `crc32`: vector estándar, cálculo por trozos.
 * `wal`: ida y vuelta, cola cortada, bit cambiado.
@@ -280,6 +295,13 @@ procesos.
 * Concurrencia: 8 hilos × 3.000 escrituras con lecturas cruzadas y reinicio,
   clave caliente desde 8 hilos coherente con el log, compactación mientras se
   escribe y se lee, group commit con 16 hilos (`synced_seq == last_seq` al final).
+* Propiedades y barrido aleatorio (`tests/propiedades.rs`, 4 pruebas): todo
+  registro vuelve idéntico; el lector no entra en panic con ninguna secuencia de
+  bytes **y siempre avanza** (sin eso, la resincronización podría quedarse en un
+  bucle infinito); la recuperación nunca *inventa* datos, solo los pierde; y el
+  motor coincide con un modelo `HashMap` a lo largo de una secuencia aleatoria
+  de operaciones, antes y después de reiniciar. Se han barrido 48.000 casos con
+  cinco semillas a mano, además de lo que hace la CI.
 * Endurecimiento del servidor (`tests/servidor.rs`, 8 pruebas): operar sin
   `AUTH`, clave equivocada, negarse a escuchar fuera de localhost sin clave, el
   tope de `KEYS` y su orden, valores con saltos de línea en los dos sentidos,

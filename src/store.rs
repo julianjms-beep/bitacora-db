@@ -25,9 +25,7 @@ use std::io::{self, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{
-    Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -409,7 +407,7 @@ fn sync_fd(f: &File, full: bool) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn sync_fd(f: &File, full: bool) -> Result<()> {
+fn sync_fd(f: &File, full: bool) -> io::Result<()> {
     if full {
         f.sync_all()
     } else {
@@ -463,13 +461,18 @@ impl Db {
 
         let nsh = opts.shards.max(1);
         let shards: Vec<Shard> = (0..nsh)
-            .map(|_| Shard { map: RwLock::new(HashMap::new()) })
+            .map(|_| Shard {
+                map: RwLock::new(HashMap::new()),
+            })
             .collect();
         let mut segments: HashMap<u32, Arc<File>> = HashMap::new();
         let mut next_seq = 1u64;
         let mut total = 0u64;
 
-        let mut report = RecoveryReport { segments: ids.len() as u64, ..Default::default() };
+        let mut report = RecoveryReport {
+            segments: ids.len() as u64,
+            ..Default::default()
+        };
         // Todo lo destructivo se aplaza hasta saber si hay corrupción: en modo
         // estricto no se modifica ni un byte de los datos del usuario.
         let mut pending_truncate: Vec<(PathBuf, Arc<File>, u64)> = Vec::new();
@@ -482,7 +485,7 @@ impl Db {
             let mut lector =
                 SegmentReader::new(BufReader::with_capacity(1 << 16, file.try_clone()?), len);
             loop {
-                match lector.next()? {
+                match lector.siguiente()? {
                     ReadOutcome::End => break,
                     ReadOutcome::IncompleteTail { at, cause } => {
                         report.truncated_tails.push((path.clone(), at));
@@ -496,7 +499,12 @@ impl Db {
                         len = at;
                         break;
                     }
-                    ReadOutcome::Corrupt { at, resync_at, cause, por_cabecera } => {
+                    ReadOutcome::Corrupt {
+                        at,
+                        resync_at,
+                        cause,
+                        por_cabecera,
+                    } => {
                         report.corrupt_records += 1;
                         report.corrupt_bytes += resync_at - at;
                         if !corruptos_en.contains(&id) {
@@ -515,8 +523,17 @@ impl Db {
                         if r.seq >= next_seq {
                             next_seq = r.seq + 1;
                         }
-                        let vlen = if r.kind == Kind::Put { r.value.len() as u32 } else { TOMB };
-                        let loc = Loc { file_id: id, vlen, vpos: r.vpos, seq: r.seq };
+                        let vlen = if r.kind == Kind::Put {
+                            r.value.len() as u32
+                        } else {
+                            TOMB
+                        };
+                        let loc = Loc {
+                            file_id: id,
+                            vlen,
+                            vpos: r.vpos,
+                            seq: r.seq,
+                        };
                         let sh = &shards[(fnv1a(&r.key) as usize) % nsh];
                         let mut m = wr(&sh.map);
                         match m.get_mut(&r.key[..]) {
@@ -609,7 +626,9 @@ impl Db {
 
         // Segmento activo: reutiliza el último si está vacío, si no crea uno nuevo.
         let (active_id, active_file) = match ids.last() {
-            Some(&last) if segments[&last].metadata()?.len() == 0 => (last, Arc::clone(&segments[&last])),
+            Some(&last) if segments[&last].metadata()?.len() == 0 => {
+                (last, Arc::clone(&segments[&last]))
+            }
             _ => {
                 let id = ids.last().map_or(1, |l| l + 1);
                 let f = Arc::new(open_segment(&opts.dir, id)?);
@@ -632,7 +651,10 @@ impl Db {
                 next_id: active_id + 1,
                 buf: Vec::with_capacity(4096),
             }),
-            synced: Mutex::new(SyncState { seq: next_seq - 1, failed: None }),
+            synced: Mutex::new(SyncState {
+                seq: next_seq - 1,
+                failed: None,
+            }),
             synced_cv: Condvar::new(),
             sync_req: Mutex::new(false),
             sync_req_cv: Condvar::new(),
@@ -655,7 +677,11 @@ impl Db {
             None
         };
 
-        Ok(Db { inner, syncer: Mutex::new(syncer), closed: AtomicBool::new(false) })
+        Ok(Db {
+            inner,
+            syncer: Mutex::new(syncer),
+            closed: AtomicBool::new(false),
+        })
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -675,7 +701,7 @@ impl Db {
                 let Writer { file, buf, .. } = &mut *w;
                 buf.clear();
                 wal::encode(buf, seq, Kind::Put, key, value);
-                let mut f: &File = &**file;
+                let mut f: &File = file;
                 if let Err(e) = f.write_all(buf) {
                     // Escritura a medias. Hay que deshacerla, porque dejar un
                     // registro roto en MEDIO del log hace que al reabrir se
@@ -795,7 +821,7 @@ impl Db {
                 let Writer { file, buf, .. } = &mut *w;
                 buf.clear();
                 wal::encode(buf, seq, Kind::Del, key, &[]);
-                let mut f: &File = &**file;
+                let mut f: &File = file;
                 if let Err(e) = f.write_all(buf) {
                     // Mismo razonamiento que en `put`: ver A1.
                     if let Err(e2) = file.set_len(start) {
@@ -958,7 +984,9 @@ impl Inner {
     fn sync_file(&self, f: &File) -> io::Result<()> {
         if let Some(n) = self.opts.fsync_falla_tras {
             if self.syncs_hechos.fetch_add(1, Ordering::Relaxed) >= n {
-                return Err(io::Error::other("fallo de E/S inyectado en fsync (solo pruebas)"));
+                return Err(io::Error::other(
+                    "fallo de E/S inyectado en fsync (solo pruebas)",
+                ));
             }
         }
         sync_fd(f, self.opts.full_fsync)
@@ -1088,7 +1116,12 @@ impl Inner {
         // C3: el nombre nuevo no es durable hasta sincronizar el directorio.
         sync_dir(&self.opts.dir)?;
         wr(&self.segments).insert(id, Arc::clone(&f));
-        Ok(OutSeg { id, file: f, len: 0, buf: Vec::with_capacity(4096) })
+        Ok(OutSeg {
+            id,
+            file: f,
+            len: 0,
+            buf: Vec::with_capacity(4096),
+        })
     }
 
     fn compact(&self) -> Result<CompactReport> {
@@ -1108,7 +1141,10 @@ impl Inner {
         };
         old_ids.sort_unstable();
         if old_ids.is_empty() {
-            return Ok(CompactReport { ran: true, ..Default::default() });
+            return Ok(CompactReport {
+                ran: true,
+                ..Default::default()
+            });
         }
 
         let mut out: Option<OutSeg> = None;
@@ -1130,7 +1166,7 @@ impl Inner {
                     }
                     return Ok(CompactReport::default());
                 }
-                let r = match lector.next()? {
+                let r = match lector.siguiente()? {
                     ReadOutcome::Record(r) => r,
                     ReadOutcome::Corrupt { at, cause, .. } => {
                         // Integridad antes que rendimiento. Si un segmento se
@@ -1172,7 +1208,7 @@ impl Inner {
                 o.buf.clear();
                 wal::encode(&mut o.buf, r.seq, Kind::Put, &r.key, &r.value);
                 {
-                    let mut f: &File = &*o.file;
+                    let mut f: &File = &o.file;
                     f.write_all(&o.buf)?;
                 }
                 let newloc = Loc {
@@ -1226,7 +1262,9 @@ impl Inner {
     fn recount(&self) {
         let total: u64 = {
             let segs = rd(&self.segments);
-            segs.values().map(|f| f.metadata().map(|m| m.len()).unwrap_or(0)).sum()
+            segs.values()
+                .map(|f| f.metadata().map(|m| m.len()).unwrap_or(0))
+                .sum()
         };
         let mut live = 0u64;
         for s in &self.shards {
@@ -1236,7 +1274,8 @@ impl Inner {
             }
         }
         self.live.store(live, Ordering::Relaxed);
-        self.dead.store(total.saturating_sub(live), Ordering::Relaxed);
+        self.dead
+            .store(total.saturating_sub(live), Ordering::Relaxed);
     }
 }
 
@@ -1299,7 +1338,11 @@ mod tests {
         sub_sat(&a, 3);
         assert_eq!(a.load(Ordering::Relaxed), 7);
         sub_sat(&a, 100);
-        assert_eq!(a.load(Ordering::Relaxed), 0, "debe quedarse en 0, no envolverse");
+        assert_eq!(
+            a.load(Ordering::Relaxed),
+            0,
+            "debe quedarse en 0, no envolverse"
+        );
         sub_sat(&a, 1);
         assert_eq!(a.load(Ordering::Relaxed), 0);
     }

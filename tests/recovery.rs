@@ -26,7 +26,12 @@ fn sobrevive_a_un_kill_9_a_mitad_de_escritura() {
     let mut start = 0u64;
     for ronda in 0..3 {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bitacora"))
-            .args(["__crashwrite", tmp.path().to_str().unwrap(), "group", &start.to_string()])
+            .args([
+                "__crashwrite",
+                tmp.path().to_str().unwrap(),
+                "group",
+                &start.to_string(),
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -37,12 +42,22 @@ fn sobrevive_a_un_kill_9_a_mitad_de_escritura() {
 
         let db = Db::open(opts(tmp.path())).expect("reabrir tras el apagón");
         let n = db.len() as u64;
-        assert!(n > start, "ronda {ronda}: debería haber escrito algo (n={n}, start={start})");
+        assert!(
+            n > start,
+            "ronda {ronda}: debería haber escrito algo (n={n}, start={start})"
+        );
         for i in 0..n {
             let v = db.get(format!("k{i}").as_bytes()).unwrap();
-            assert_eq!(v.as_deref(), Some(&demo_value(i)[..]), "ronda {ronda}: k{i} corrupta o perdida");
+            assert_eq!(
+                v.as_deref(),
+                Some(&demo_value(i)[..]),
+                "ronda {ronda}: k{i} corrupta o perdida"
+            );
         }
-        assert!(db.get(format!("k{n}").as_bytes()).unwrap().is_none(), "ronda {ronda}: hay huecos");
+        assert!(
+            db.get(format!("k{n}").as_bytes()).unwrap().is_none(),
+            "ronda {ronda}: hay huecos"
+        );
         drop(db);
         start = n;
     }
@@ -59,20 +74,41 @@ fn cola_rota_se_recorta_y_lo_demas_sobrevive() {
     }
     // Simula un apagón: añade al final del segmento 40 bytes de un registro
     // válido que nunca se terminó de escribir.
-    let (path, len_ok) = segments(tmp.path()).into_iter().max_by_key(|(_, l)| *l).unwrap();
+    let (path, len_ok) = segments(tmp.path())
+        .into_iter()
+        .max_by_key(|(_, l)| *l)
+        .unwrap();
     let mut rec = Vec::new();
-    bitacora::wal::encode(&mut rec, 999, bitacora::wal::Kind::Put, b"k_rota", &vec![b'z'; 500]);
+    bitacora::wal::encode(
+        &mut rec,
+        999,
+        bitacora::wal::Kind::Put,
+        b"k_rota",
+        &vec![b'z'; 500],
+    );
     rec.truncate(40);
-    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&rec).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&rec)
+        .unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), len_ok + 40);
 
     let db = Db::open(opts(tmp.path())).unwrap();
     assert_eq!(db.len(), 200);
     for i in 0..200u64 {
-        assert_eq!(db.get(format!("k{i}").as_bytes()).unwrap().unwrap(), demo_value(i));
+        assert_eq!(
+            db.get(format!("k{i}").as_bytes()).unwrap().unwrap(),
+            demo_value(i)
+        );
     }
     assert!(db.get(b"k_rota").unwrap().is_none());
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), len_ok, "la cola rota debe recortarse");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        len_ok,
+        "la cola rota debe recortarse"
+    );
 }
 
 /// Un bit corrupto **en el último registro del fichero**. Es el único caso en
@@ -88,7 +124,10 @@ fn un_bit_corrupto_en_el_ultimo_registro_descarta_solo_ese_registro() {
             db.put(format!("k{i}").as_bytes(), &demo_value(i)).unwrap();
         }
     }
-    let (path, len) = segments(tmp.path()).into_iter().max_by_key(|(_, l)| *l).unwrap();
+    let (path, len) = segments(tmp.path())
+        .into_iter()
+        .max_by_key(|(_, l)| *l)
+        .unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
     let last = demo_value(49).len() as u64; // el último valor está al final del fichero
     let idx = (len - last + 2) as usize;
@@ -110,18 +149,28 @@ fn borrados_sobreviven_a_compactacion_y_reinicio() {
         let db = Db::open(o.clone()).unwrap();
         for ronda in 0..20u64 {
             for i in 0..100u64 {
-                db.put(format!("k{i}").as_bytes(), format!("r{ronda}-{i}").as_bytes()).unwrap();
+                db.put(
+                    format!("k{i}").as_bytes(),
+                    format!("r{ronda}-{i}").as_bytes(),
+                )
+                .unwrap();
             }
         }
         for i in (0..100u64).step_by(2) {
             assert!(db.delete(format!("k{i}").as_bytes()).unwrap());
         }
-        assert!(!db.delete(b"k0").unwrap(), "borrar dos veces devuelve false");
+        assert!(
+            !db.delete(b"k0").unwrap(),
+            "borrar dos veces devuelve false"
+        );
         let before = common::disk_bytes(tmp.path());
         let rep = db.compact().unwrap();
         assert!(rep.ran && rep.segments_removed > 0);
         let after = common::disk_bytes(tmp.path());
-        assert!(after < before / 4, "compactar debe liberar espacio: {before} -> {after}");
+        assert!(
+            after < before / 4,
+            "compactar debe liberar espacio: {before} -> {after}"
+        );
         assert_eq!(db.len(), 50);
     }
     let db = Db::open(o).unwrap();
@@ -147,7 +196,10 @@ fn claves_y_valores_binarios_y_limites() {
     assert_eq!(db.get(&key).unwrap().unwrap(), val);
     assert_eq!(db.get(b"vacio").unwrap().unwrap(), b"");
     assert!(db.put(b"", b"x").is_err(), "clave vacía rechazada");
-    assert!(db.put(&vec![b'k'; 70_000], b"x").is_err(), "clave de 70 KB rechazada");
+    assert!(
+        db.put(&vec![b'k'; 70_000], b"x").is_err(),
+        "clave de 70 KB rechazada"
+    );
     drop(db);
     let db = Db::open(opts(tmp.path())).unwrap();
     assert_eq!(db.get(&key).unwrap().unwrap(), val);

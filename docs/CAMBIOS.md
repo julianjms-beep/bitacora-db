@@ -212,3 +212,18 @@ clientes que abren una conexión y la dejan parada más de 300 s, súbelo con
 * `GET` devuelve error, en vez de corromper el entramado, si el valor contiene
   saltos de línea, y si supera `--valor-max-mb` (16 MB por defecto). Esos
   valores siguen accesibles desde la API de Rust.
+
+---
+
+## Gate 4 — red de seguridad
+
+### `wal::SegmentReader::next` pasa a llamarse `siguiente`
+
+Se llamaba igual que `Iterator::next` sin serlo, que es justo la clase de nombre
+que induce a error (y lo avisaba clippy). Solo afecta a quien use
+`SegmentReader` directamente.
+
+### Nada más cambia
+
+La CI, el formato, las pruebas por propiedades y el barrido aleatorio no tocan
+la API ni el protocolo.

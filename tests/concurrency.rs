@@ -28,7 +28,11 @@ fn escrituras_paralelas_sin_perdidas_y_coherentes_tras_reinicio() {
                 let db = Arc::clone(&db);
                 thread::spawn(move || {
                     for i in 0..N {
-                        db.put(format!("t{t}-k{i}").as_bytes(), format!("v{t}-{i}").as_bytes()).unwrap();
+                        db.put(
+                            format!("t{t}-k{i}").as_bytes(),
+                            format!("v{t}-{i}").as_bytes(),
+                        )
+                        .unwrap();
                         // lectura cruzada: la clave que otro hilo quizá ya escribió
                         let other = (t + 1) % T;
                         if let Some(v) = db.get(format!("t{other}-k{i}").as_bytes()).unwrap() {
@@ -78,7 +82,10 @@ fn clave_caliente_memoria_y_log_coinciden() {
             h.join().unwrap();
         }
         en_memoria = db.get(b"hot").unwrap().unwrap();
-        assert!(en_memoria.ends_with(b"-1999"), "la última escritura de algún hilo");
+        assert!(
+            en_memoria.ends_with(b"-1999"),
+            "la última escritura de algún hilo"
+        );
     }
     let db = Db::open(o).unwrap();
     assert_eq!(db.get(b"hot").unwrap().unwrap(), en_memoria);
@@ -101,7 +108,8 @@ fn compactar_mientras_se_escribe_y_se_lee() {
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let k = (n % 200) as usize;
-                db.put(format!("k{k}").as_bytes(), format!("v{n}").as_bytes()).unwrap();
+                db.put(format!("k{k}").as_bytes(), format!("v{n}").as_bytes())
+                    .unwrap();
                 last[k] = n;
                 n += 1;
             }
@@ -116,7 +124,10 @@ fn compactar_mientras_se_escribe_y_se_lee() {
             while !stop.load(Ordering::Relaxed) {
                 for k in 0..200 {
                     if let Some(v) = db.get(format!("k{k}").as_bytes()).unwrap() {
-                        assert!(v.starts_with(b"v"), "valor basura leído durante la compactación");
+                        assert!(
+                            v.starts_with(b"v"),
+                            "valor basura leído durante la compactación"
+                        );
                         reads += 1;
                     }
                 }
@@ -136,17 +147,29 @@ fn compactar_mientras_se_escribe_y_se_lee() {
     stop.store(true, Ordering::Relaxed);
     let last = writer.join().unwrap();
     let reads = reader.join().unwrap();
-    assert!(compactions >= 3, "deberían haberse ejecutado varias compactaciones ({compactions})");
-    assert!(reads > 1000, "el lector debería haber leído mucho ({reads})");
+    assert!(
+        compactions >= 3,
+        "deberían haberse ejecutado varias compactaciones ({compactions})"
+    );
+    assert!(
+        reads > 1000,
+        "el lector debería haber leído mucho ({reads})"
+    );
 
     for (k, n) in last.iter().enumerate() {
-        assert_eq!(db.get(format!("k{k}").as_bytes()).unwrap().unwrap(), format!("v{n}").into_bytes());
+        assert_eq!(
+            db.get(format!("k{k}").as_bytes()).unwrap().unwrap(),
+            format!("v{n}").into_bytes()
+        );
     }
     drop(db);
     let db = Db::open(o).unwrap();
     assert_eq!(db.len(), 200);
     for (k, n) in last.iter().enumerate() {
-        assert_eq!(db.get(format!("k{k}").as_bytes()).unwrap().unwrap(), format!("v{n}").into_bytes());
+        assert_eq!(
+            db.get(format!("k{k}").as_bytes()).unwrap().unwrap(),
+            format!("v{n}").into_bytes()
+        );
     }
 }
 

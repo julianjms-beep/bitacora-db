@@ -19,13 +19,19 @@ pub enum Command<'a> {
     /// Autenticación por secreto compartido. Solo hace falta si el servidor se
     /// arrancó con una clave.
     Auth(&'a [u8]),
-    Set { key: &'a [u8], value: &'a [u8] },
+    Set {
+        key: &'a [u8],
+        value: &'a [u8],
+    },
     Get(&'a [u8]),
     Del(&'a [u8]),
     Exists(&'a [u8]),
     /// `KEYS [prefijo] [limite]`. Sin límite explícito, el servidor aplica el
     /// suyo: A3, antes no había ninguno.
-    Keys { prefix: &'a [u8], limite: Option<usize> },
+    Keys {
+        prefix: &'a [u8],
+        limite: Option<usize>,
+    },
     Stats,
     Compact,
     Ping,
@@ -77,7 +83,10 @@ pub fn parse(line: &[u8]) -> Result<Command<'_>, &'static str> {
             let limite = if lim.is_empty() {
                 None
             } else {
-                match std::str::from_utf8(lim).ok().and_then(|s| s.parse::<usize>().ok()) {
+                match std::str::from_utf8(lim)
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
                     Some(n) => Some(n),
                     None => return Err("uso: KEYS [prefijo] [limite]"),
                 }
@@ -117,7 +126,10 @@ mod tests {
     fn set_con_espacios_en_el_valor() {
         assert_eq!(
             parse(b"set user:1 Ana Garcia\r\n").unwrap(),
-            Command::Set { key: b"user:1", value: b"Ana Garcia" }
+            Command::Set {
+                key: b"user:1",
+                value: b"Ana Garcia"
+            }
         );
     }
 
@@ -127,16 +139,31 @@ mod tests {
         assert!(parse(b"GET").is_err());
         assert!(parse(b"GET a b").is_err());
         assert!(parse(b"HOLA").is_err());
-        assert_eq!(parse(b"KEYS").unwrap(), Command::Keys { prefix: b"", limite: None });
+        assert_eq!(
+            parse(b"KEYS").unwrap(),
+            Command::Keys {
+                prefix: b"",
+                limite: None
+            }
+        );
         assert_eq!(
             parse(b"KEYS us").unwrap(),
-            Command::Keys { prefix: b"us", limite: None }
+            Command::Keys {
+                prefix: b"us",
+                limite: None
+            }
         );
         assert_eq!(
             parse(b"KEYS us 10").unwrap(),
-            Command::Keys { prefix: b"us", limite: Some(10) }
+            Command::Keys {
+                prefix: b"us",
+                limite: Some(10)
+            }
         );
-        assert!(parse(b"KEYS us diez").is_err(), "un límite no numérico es un error");
+        assert!(
+            parse(b"KEYS us diez").is_err(),
+            "un límite no numérico es un error"
+        );
         assert_eq!(parse(b"AUTH secreto").unwrap(), Command::Auth(b"secreto"));
         assert!(parse(b"AUTH").is_err(), "AUTH sin clave es un error");
     }

@@ -50,7 +50,11 @@ impl Servidor {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        Servidor { parada, hilo: Some(hilo), puerto: p }
+        Servidor {
+            parada,
+            hilo: Some(hilo),
+            puerto: p,
+        }
     }
 
     fn conecta(&self) -> TcpStream {
@@ -101,7 +105,10 @@ fn sin_auth_no_se_puede_operar() {
 
     let r = srv.pide("SET k v\nQUIT\n", 1);
     assert!(r[0].starts_with("ERR invalida"), "debía exigir AUTH: {r:?}");
-    assert!(r[0].contains("AUTH"), "el error debe decir qué falta: {r:?}");
+    assert!(
+        r[0].contains("AUTH"),
+        "el error debe decir qué falta: {r:?}"
+    );
 
     // PING y QUIT sí se permiten antes de autenticarse.
     assert_eq!(srv.pide("PING\nQUIT\n", 1)[0], "PONG");
@@ -110,7 +117,11 @@ fn sin_auth_no_se_puede_operar() {
     assert!(r[0].starts_with("ERR invalida"), "clave mala: {r:?}");
 
     let r = srv.pide("AUTH secreto-largo\nSET k v\nGET k\nQUIT\n", 3);
-    assert_eq!(r, vec!["OK", "OK", "VAL v"], "con la clave buena debe funcionar");
+    assert_eq!(
+        r,
+        vec!["OK", "OK", "VAL v"],
+        "con la clave buena debe funcionar"
+    );
 }
 
 /// Escuchar fuera de localhost sin clave daría lectura, escritura y COMPACT a
@@ -146,7 +157,10 @@ fn keys_respeta_el_tope_y_avisa() {
     let srv = Servidor::nuevo(db, cfg);
 
     let r = srv.pide("KEYS\nQUIT\n", 11);
-    assert_eq!(r[0], "KEYS 10 truncado", "debe avisar de que hay más: {r:?}");
+    assert_eq!(
+        r[0], "KEYS 10 truncado",
+        "debe avisar de que hay más: {r:?}"
+    );
     assert_eq!(r[1], "k000", "y lo devuelto debe ser el principio EN ORDEN");
     assert_eq!(r[10], "k009");
 
@@ -159,7 +173,10 @@ fn keys_respeta_el_tope_y_avisa() {
     let r = srv.pide("KEYS k 10000\nQUIT\n", 1);
     assert!(r[0].starts_with("KEYS "), "{r:?}");
     let n: usize = r[0].split_whitespace().nth(1).unwrap().parse().unwrap();
-    assert!(n <= 10, "el cliente no puede superar el tope del servidor: {n}");
+    assert!(
+        n <= 10,
+        "el cliente no puede superar el tope del servidor: {n}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -179,8 +196,14 @@ fn los_saltos_de_linea_no_rompen_el_entramado() {
     let srv = Servidor::nuevo(Arc::clone(&db), ServerConfig::new("127.0.0.1", puerto(4)));
 
     let r = srv.pide("GET conSalto\nPING\nQUIT\n", 2);
-    assert!(r[0].starts_with("ERR"), "no debe enviar un valor con salto: {r:?}");
-    assert_eq!(r[1], "PONG", "y el entramado debe seguir sano tras el error");
+    assert!(
+        r[0].starts_with("ERR"),
+        "no debe enviar un valor con salto: {r:?}"
+    );
+    assert_eq!(
+        r[1], "PONG",
+        "y el entramado debe seguir sano tras el error"
+    );
 
     let r = srv.pide("GET conRetorno\nPING\nQUIT\n", 2);
     assert!(r[0].starts_with("ERR"), "{r:?}");
@@ -209,7 +232,10 @@ fn no_envia_valores_mayores_que_el_tope() {
 
     let r = srv.pide("GET grande\nGET pequeno\nQUIT\n", 2);
     assert!(r[0].starts_with("ERR invalida"), "debía rechazarlo: {r:?}");
-    assert!(r[0].contains("5000"), "el error debe decir el tamaño: {r:?}");
+    assert!(
+        r[0].contains("5000"),
+        "el error debe decir el tamaño: {r:?}"
+    );
     assert_eq!(r[1], "VAL vale", "y lo pequeño sigue funcionando");
 }
 
@@ -239,7 +265,9 @@ fn se_respeta_el_limite_de_conexiones() {
         let mut s = srv.conecta();
         s.write_all(b"PING\n").unwrap();
         let mut l = String::new();
-        BufReader::new(s.try_clone().unwrap()).read_line(&mut l).unwrap();
+        BufReader::new(s.try_clone().unwrap())
+            .read_line(&mut l)
+            .unwrap();
         if l.contains("demasiadas conexiones") {
             rechazadas += 1;
         } else {
@@ -252,7 +280,10 @@ fn se_respeta_el_limite_de_conexiones() {
         admitidas <= 2,
         "se admitieron {admitidas} conexiones con un tope de 2: el limite no se respeta"
     );
-    assert!(rechazadas >= 2, "con 4 conexiones y tope 2 debían rechazarse al menos 2");
+    assert!(
+        rechazadas >= 2,
+        "con 4 conexiones y tope 2 debían rechazarse al menos 2"
+    );
 
     // Al soltarlas, las plazas vuelven a quedar libres.
     abiertas.clear();
@@ -261,7 +292,9 @@ fn se_respeta_el_limite_de_conexiones() {
         let mut s = srv.conecta();
         s.write_all(b"PING\n").unwrap();
         let mut l = String::new();
-        BufReader::new(s.try_clone().unwrap()).read_line(&mut l).unwrap();
+        BufReader::new(s.try_clone().unwrap())
+            .read_line(&mut l)
+            .unwrap();
         if l.trim_end() == "PONG" {
             break;
         }
@@ -292,7 +325,10 @@ fn una_conexion_muda_se_cierra_por_tiempo() {
     let mut buf = [0u8; 16];
     let n = (&s).read(&mut buf).unwrap_or(0);
     let tardo = t0.elapsed();
-    assert_eq!(n, 0, "el servidor debía cerrar la conexión muda, no responder");
+    assert_eq!(
+        n, 0,
+        "el servidor debía cerrar la conexión muda, no responder"
+    );
     assert!(
         tardo < Duration::from_secs(4),
         "tardó {tardo:?}: el tiempo de espera no se está aplicando"
@@ -324,7 +360,11 @@ fn el_servidor_para_cuando_se_le_pide() {
     let t0 = Instant::now();
     let r = hilo.join().expect("el hilo del servidor entró en panic");
     assert!(r.is_ok(), "serve debía volver sin error: {r:?}");
-    assert!(t0.elapsed() < Duration::from_secs(8), "tardó {:?} en parar", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(8),
+        "tardó {:?} en parar",
+        t0.elapsed()
+    );
     // Y el motor se puede cerrar limpiamente después.
     db.close().unwrap();
 }
