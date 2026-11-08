@@ -19,7 +19,7 @@
 
 use crate::error::{Error, Result};
 use crate::wal::{self, Kind, ReadOutcome, SegmentReader, HEADER, MAX_KEY, MAX_VALUE};
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Write};
 use std::os::unix::fs::FileExt;
@@ -825,19 +825,37 @@ impl Db {
         Ok(true)
     }
 
-    /// Claves que empiezan por `prefix`, ordenadas.
-    pub fn keys(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
-        let mut out = Vec::new();
+    /// Las `limite` primeras claves que empiezan por `prefix`, en orden
+    /// alfabético. Devuelve además si había más.
+    ///
+    /// A3: antes copiaba **todas** las claves a un `Vec` y lo ordenaba. Con
+    /// 200.000 claves eso es un vector de 200.000 elementos y un `sort` por
+    /// cada cliente que lo pidiera, sin ningún tope. Ahora se usa un montículo
+    /// acotado: la memoria es O(limite) y el resultado sigue siendo las
+    /// `limite` primeras **en orden**, no las primeras que se encuentren, que
+    /// con 64 shards sería un orden arbitrario.
+    pub fn keys(&self, prefix: &[u8], limite: usize) -> (Vec<Vec<u8>>, bool) {
+        let mut heap: BinaryHeap<Vec<u8>> = BinaryHeap::new();
+        let mut total = 0usize;
         for s in &self.inner.shards {
             let m = rd(&s.map);
             for k in m.keys() {
-                if k.starts_with(prefix) {
-                    out.push(k.to_vec());
+                if !k.starts_with(prefix) {
+                    continue;
+                }
+                total += 1;
+                if limite == 0 {
+                    continue;
+                }
+                heap.push(k.to_vec());
+                if heap.len() > limite {
+                    heap.pop(); // fuera la mayor: nos quedamos con las menores
                 }
             }
         }
+        let mut out = heap.into_vec();
         out.sort();
-        out
+        (out, total > limite)
     }
 
     pub fn len(&self) -> usize {

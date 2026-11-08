@@ -150,3 +150,65 @@ Tras un panic conviene reiniciar.
 `#[doc(hidden)]`, solo para inyección de fallos en pruebas). Si construyes
 `Options` con `Options::new(dir)` y luego asignas campos, no hay nada que
 cambiar; si lo construías con un literal de estructura, hay que añadirlos.
+
+---
+
+## Gate 3 — endurecimiento del servidor
+
+### `Db::keys` cambia de firma
+
+```rust
+// antes
+pub fn keys(&self, prefix: &[u8]) -> Vec<Vec<u8>>
+
+// ahora
+pub fn keys(&self, prefix: &[u8], limite: usize) -> (Vec<Vec<u8>>, bool)
+```
+
+El segundo elemento dice si había más. Sin tope, un solo `KEYS` sobre 200.000
+claves construía y ordenaba una lista de 200.000 elementos por cada cliente que
+lo pidiera. El resultado sigue siendo las `limite` primeras **en orden**, no las
+primeras que se encuentren: por dentro se usa un montículo acotado, así que la
+memoria es O(limite) en vez de O(claves).
+
+### `ServerConfig` tiene siete campos más
+
+`read_timeout`, `write_timeout`, `keys_limit`, `max_value_bytes`, `clave`,
+`permitir_sin_clave` y `parada`. *Qué hacer:* construirlo con
+`ServerConfig::new(host, puerto)` y asignar lo que haga falta, en vez de con un
+literal de estructura.
+
+### `server::handle` y `server::execute` cambian de firma
+
+Reciben `&ServerConfig`, y `execute` además `&mut bool` con el estado de
+autenticación de la conexión.
+
+### El servidor se niega a escuchar fuera de localhost sin clave
+
+Escuchar en `0.0.0.0` sin autenticación es dar lectura, escritura y `COMPACT` a
+quien llegue. Ahora `serve` falla con un mensaje que dice cómo arreglarlo.
+*Qué hacer:* `--clave <secreto>` (o la variable `BITACORA_CLAVE`, para no
+dejarla en la lista de procesos), o `--sin-clave` si de verdad se quiere así.
+
+### Las conexiones inactivas se cierran
+
+Por defecto, 300 s de espera de lectura y 60 s de escritura; `0` las desactiva.
+Sin tiempos de espera, unas pocas conexiones mudas retenían todos los hilos y
+el servidor quedaba inaccesible sin recibir un byte útil. *Qué hacer:* si tienes
+clientes que abren una conexión y la dejan parada más de 300 s, súbelo con
+`--timeout-lectura` o manda `PING` de vez en cuando.
+
+### El protocolo gana órdenes y cambia dos respuestas
+
+* **Nueva orden** `AUTH <clave>`, obligatoria antes de operar si el servidor se
+  arrancó con clave. `PING` y `QUIT` se permiten sin autenticarse.
+* `KEYS` acepta ahora `KEYS [prefijo] [limite]`.
+* La cabecera de `KEYS` puede llevar sufijo: `KEYS <n> truncado`. Un cliente
+  que leyera el segundo campo como número sigue funcionando; uno que exigiera
+  exactamente dos campos, no.
+* `SET` **rechaza** valores con `\n` o `\r`: el protocolo es por líneas, y
+  antes un valor así hacía que el cliente leyera dos respuestas donde había
+  una. La API de Rust sigue aceptando binario con saltos.
+* `GET` devuelve error, en vez de corromper el entramado, si el valor contiene
+  saltos de línea, y si supera `--valor-max-mb` (16 MB por defecto). Esos
+  valores siguen accesibles desde la API de Rust.

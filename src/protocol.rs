@@ -1,6 +1,7 @@
 //! Protocolo de texto, una orden por línea (funciona con `nc`):
 //!
 //! ```text
+//! AUTH clave           -> OK | ERR
 //! SET clave valor      -> OK
 //! GET clave            -> VAL <valor> | NIL
 //! DEL clave            -> OK | NIL
@@ -15,11 +16,16 @@
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command<'a> {
+    /// Autenticación por secreto compartido. Solo hace falta si el servidor se
+    /// arrancó con una clave.
+    Auth(&'a [u8]),
     Set { key: &'a [u8], value: &'a [u8] },
     Get(&'a [u8]),
     Del(&'a [u8]),
     Exists(&'a [u8]),
-    Keys(&'a [u8]),
+    /// `KEYS [prefijo] [limite]`. Sin límite explícito, el servidor aplica el
+    /// suyo: A3, antes no había ninguno.
+    Keys { prefix: &'a [u8], limite: Option<usize> },
     Stats,
     Compact,
     Ping,
@@ -65,13 +71,33 @@ pub fn parse(line: &[u8]) -> Result<Command<'_>, &'static str> {
         b"GET" => one(rest, "uso: GET clave").map(Command::Get),
         b"DEL" | b"DELETE" => one(rest, "uso: DEL clave").map(Command::Del),
         b"EXISTS" => one(rest, "uso: EXISTS clave").map(Command::Exists),
-        b"KEYS" => Ok(Command::Keys(split_word(rest).0)),
+        b"KEYS" => {
+            let (prefix, resto) = split_word(rest);
+            let (lim, _) = split_word(resto);
+            let limite = if lim.is_empty() {
+                None
+            } else {
+                match std::str::from_utf8(lim).ok().and_then(|s| s.parse::<usize>().ok()) {
+                    Some(n) => Some(n),
+                    None => return Err("uso: KEYS [prefijo] [limite]"),
+                }
+            };
+            Ok(Command::Keys { prefix, limite })
+        }
         b"STATS" | b"INFO" => Ok(Command::Stats),
         b"COMPACT" => Ok(Command::Compact),
+        b"AUTH" => {
+            let (clave, _) = split_word(rest);
+            if clave.is_empty() {
+                Err("uso: AUTH clave")
+            } else {
+                Ok(Command::Auth(clave))
+            }
+        }
         b"PING" => Ok(Command::Ping),
         b"QUIT" | b"EXIT" => Ok(Command::Quit),
         b"" => Err("línea vacía"),
-        _ => Err("comando desconocido (SET GET DEL EXISTS KEYS STATS COMPACT PING QUIT)"),
+        _ => Err("comando desconocido (AUTH SET GET DEL EXISTS KEYS STATS COMPACT PING QUIT)"),
     }
 }
 
@@ -101,7 +127,17 @@ mod tests {
         assert!(parse(b"GET").is_err());
         assert!(parse(b"GET a b").is_err());
         assert!(parse(b"HOLA").is_err());
-        assert_eq!(parse(b"KEYS").unwrap(), Command::Keys(b""));
-        assert_eq!(parse(b"KEYS us").unwrap(), Command::Keys(b"us"));
+        assert_eq!(parse(b"KEYS").unwrap(), Command::Keys { prefix: b"", limite: None });
+        assert_eq!(
+            parse(b"KEYS us").unwrap(),
+            Command::Keys { prefix: b"us", limite: None }
+        );
+        assert_eq!(
+            parse(b"KEYS us 10").unwrap(),
+            Command::Keys { prefix: b"us", limite: Some(10) }
+        );
+        assert!(parse(b"KEYS us diez").is_err(), "un límite no numérico es un error");
+        assert_eq!(parse(b"AUTH secreto").unwrap(), Command::Auth(b"secreto"));
+        assert!(parse(b"AUTH").is_err(), "AUTH sin clave es un error");
     }
 }

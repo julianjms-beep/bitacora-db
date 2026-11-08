@@ -20,6 +20,19 @@ Lo que **no** se ha hecho y por tanto no se afirma: no se ha ejecutado Miri, ni 
 fuzzing, ni pruebas en Linux (todo lo medido es macOS/arm64), ni se han reproducido los
 benchmarks que publica el README.
 
+## Estado a 8 de noviembre de 2026
+
+Resueltos en los gates 0 a 3: **C1, C2, C3, A1, A2, A3, A4, A5, A6, A7, M1, M2,
+M3, M4, M5, M6 y M8**, más una fuga de conexiones que no estaba en este informe
+(un hilo que entraba en panic nunca decrementaba el contador). Pruebas: 17 al
+auditar, **55** ahora.
+
+Pendientes: **M7** (`KEYS`, `len()` y `stats()` no son instantáneas coherentes;
+documentado, no arreglado), **M9** (CRC32 no detecta manipulación; documentado
+como límite de seguridad), **B1**, **B2** y **B3** (sin CI, sin property-based,
+sin fuzzing, 0 doc-tests). Los límites de recuperación que el formato actual no
+permite salvar están en `docs/RECUPERACION.md`.
+
 ## Resumen
 
 | Criticidad | Nº | Naturaleza |

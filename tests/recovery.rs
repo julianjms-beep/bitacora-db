@@ -151,5 +151,5 @@ fn claves_y_valores_binarios_y_limites() {
     drop(db);
     let db = Db::open(opts(tmp.path())).unwrap();
     assert_eq!(db.get(&key).unwrap().unwrap(), val);
-    assert_eq!(db.keys(b"va"), vec![b"vacio".to_vec()]);
+    assert_eq!(db.keys(b"va", 100), (vec![b"vacio".to_vec()], false));
 }

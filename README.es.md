@@ -55,7 +55,7 @@ Opciones de `serve`: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
 Pruebas y benchmark:
 
 ```bash
-cargo test                                   # 45 pruebas (unitarias + integración)
+cargo test                                   # 55 pruebas (unitarias + integración)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -244,7 +244,27 @@ inválida» de «el disco acaba de fallar», que son justo los dos casos cuya
 respuesta correcta es opuesta. Los cambios incompatibles están en
 [docs/CAMBIOS.md](docs/CAMBIOS.md).
 
-## Pruebas (45)
+## Endurecer la superficie expuesta
+
+El motor puede ser impecable y el servidor ser la pieza frágil. Lo que hay, y
+qué evita cada cosa:
+
+| Defensa | Sin ella |
+|---|---|
+| Tiempos de espera de lectura y escritura | Un cliente que abre el socket y no envía nada retiene un hilo para siempre; con `--max-conns` conexiones mudas el servidor queda inaccesible sin enviar un byte útil |
+| Tope en `KEYS`, con aviso `truncado` | Un solo `KEYS` sobre 200.000 claves construye y ordena una lista de 200.000 elementos por cliente |
+| El fallo al crear un hilo no es fatal | Con los hilos agotados moría el servidor entero en vez de rechazar esa conexión |
+| Admisión atómica de conexiones | `load` y luego `fetch_add` no es atómico, así que el límite se podía superar |
+| Saltos de línea rechazados por el socket | El protocolo es por líneas: un valor con `\n` hacía que el cliente leyera dos respuestas donde había una |
+| Apagado ordenado con SIGINT/SIGTERM | Ctrl-C mataba el proceso en seco: sin `fsync` final y con la compactación cortada por donde fuera |
+| Tope al tamaño de respuesta | Un valor de 1 GiB suponía 1 GiB reservado por lectura concurrente |
+| `AUTH` opcional, y negarse a escuchar fuera de localhost sin él | Cualquiera que llegase al puerto tenía lectura, escritura y `COMPACT` |
+
+`AUTH` usa un secreto compartido, comparado en tiempo constante, que viene de
+`--clave` o de la variable `BITACORA_CLAVE` para no dejarlo en la lista de
+procesos.
+
+## Pruebas (55)
 
 * `crc32`: vector estándar, cálculo por trozos.
 * `wal`: ida y vuelta, cola cortada, bit cambiado.
@@ -260,6 +280,12 @@ respuesta correcta es opuesta. Los cambios incompatibles están en
 * Concurrencia: 8 hilos × 3.000 escrituras con lecturas cruzadas y reinicio,
   clave caliente desde 8 hilos coherente con el log, compactación mientras se
   escribe y se lee, group commit con 16 hilos (`synced_seq == last_seq` al final).
+* Endurecimiento del servidor (`tests/servidor.rs`, 8 pruebas): operar sin
+  `AUTH`, clave equivocada, negarse a escuchar fuera de localhost sin clave, el
+  tope de `KEYS` y su orden, valores con saltos de línea en los dos sentidos,
+  el tope de tamaño de respuesta, el límite de conexiones y que las plazas se
+  liberan, el cierre de una conexión muda por tiempo, y que `serve` vuelve
+  cuando se le pide.
 * Durabilidad con el disco fallando (`tests/durabilidad.rs`, 6 pruebas, con
   errores de `fsync` inyectados): la marca no avanza más allá de un `fsync`
   fallido, el escritor recibe el error en vez de colgarse, **todos** los

@@ -89,7 +89,7 @@ QUIT                       → BYE
 Tests and benchmark:
 
 ```bash
-cargo test                                   # 45 tests (unit + integration)
+cargo test                                   # 55 tests (unit + integration)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -270,7 +270,26 @@ This replaced `io::Error` everywhere, which could not distinguish "your key is
 invalid" from "the disk just failed" — the two cases with opposite correct
 responses. See [docs/CAMBIOS.md](docs/CAMBIOS.md) for the incompatible changes.
 
-## Tests (45)
+## Hardening the exposed surface
+
+The engine can be flawless and the server still be the fragile part. What is in
+place, and what it prevents:
+
+| Guard | Without it |
+|---|---|
+| Read and write timeouts | A client that opens a socket and sends nothing holds a thread forever; `--max-conns` mute connections make the server unreachable without sending a useful byte |
+| `KEYS` cap, with a `truncado` marker | One `KEYS` over 200,000 keys builds and sorts a 200,000-element list per client |
+| Thread-spawn failure is not fatal | Under thread exhaustion the whole server died instead of refusing that one connection |
+| Atomic connection admission | `load` then `fetch_add` is not atomic, so the limit could be exceeded |
+| Newlines refused on the wire | The protocol is line-based, so a value containing `\n` made the client read two replies where there was one |
+| Graceful shutdown on SIGINT/SIGTERM | Ctrl-C killed the process mid-flight: no final `fsync`, compaction cut wherever it was |
+| Response size cap | A 1 GiB value meant 1 GiB reserved per concurrent read |
+| Optional `AUTH`, and refusing to listen off-localhost without it | Anyone who could reach the port had read, write and `COMPACT` |
+
+`AUTH` takes a shared secret, compared in constant time, from `--clave` or the
+`BITACORA_CLAVE` environment variable so it does not sit in the process list.
+
+## Tests (55)
 
 * `crc32`: standard vector, chunked computation.
 * `wal`: round trip, truncated tail, flipped bit.
@@ -286,6 +305,11 @@ responses. See [docs/CAMBIOS.md](docs/CAMBIOS.md) for the incompatible changes.
 * Concurrency: 8 threads × 3,000 writes with interleaved reads and a restart, one hot
   key from 8 threads staying consistent with the log, compaction while reading and
   writing, group commit with 16 threads (`synced_seq == last_seq` at the end).
+* Server hardening (`tests/servidor.rs`, 8 tests): operating before `AUTH`,
+  a wrong key, refusing to bind off-localhost without one, the `KEYS` cap and
+  its ordering, values with newlines in both directions, the response size cap,
+  the connection limit and that slots are released, a mute connection being
+  timed out, and `serve` returning on request.
 * Durability under disk failure (`tests/durabilidad.rs`, 6 tests, via injected
   `fsync` errors): the watermark does not advance past a failed sync, the writer
   gets the error instead of hanging, **all** waiting writers get it, a failure

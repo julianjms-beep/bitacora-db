@@ -1,4 +1,4 @@
-use bitacora::server::{serve, ServerConfig};
+use bitacora::server::{instalar_senales, serve, ServerConfig};
 use bitacora::{demo_value, Db, FsyncPolicy, Options, RecoveryPolicy};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -31,6 +31,9 @@ USO
   bitacora serve [--dir data] [--host 127.0.0.1] [--port 7379] [--fsync group|always|never]
                  [--fullfsync] [--segment-mb 64] [--max-conns 1024]
                  [--recuperacion estricto|reparar]
+                 [--clave SECRETO] [--sin-clave]
+                 [--timeout-lectura 300] [--timeout-escritura 60]
+                 [--keys-max 10000] [--valor-max-mb 16]
 
   --recuperacion estricto (por defecto): si el WAL tiene corrupción, NO abre y no
                  modifica ningún fichero. Una recuperación incompleta nunca se
@@ -38,6 +41,18 @@ USO
   --recuperacion reparar: abre saltándose los registros ilegibles, tras copiar
                  cada segmento afectado a NNNNNN.log.corrupto-<epoch>, e informa
                  de cuántos registros y bytes se perdieron.
+  --clave: exige AUTH <clave> en cada conexión. También se puede dar en la
+                 variable BITACORA_CLAVE, para no dejarla en la lista de
+                 procesos. Sin clave, el servidor se niega a escuchar fuera de
+                 localhost salvo que se le pase --sin-clave.
+  --timeout-lectura / --timeout-escritura: segundos; 0 = sin límite. Sin
+                 tiempos de espera, unas pocas conexiones mudas retienen todos
+                 los hilos y el servidor queda inaccesible.
+  --keys-max: tope de claves que devuelve KEYS. El cliente puede pedir menos
+                 (KEYS prefijo limite), nunca más.
+  --valor-max-mb: tamaño máximo de valor que se envía por el socket. Los
+                 valores mayores siguen accesibles desde la API de Rust.
+
   bitacora cli   [--host 127.0.0.1] [--port 7379]
   bitacora bench [--threads 8] [--ops 200000] [--value-bytes 100] [--fsync never|group|always]
                  [--dir /tmp]"
@@ -86,11 +101,21 @@ fn cmd_serve(args: &[String]) -> i32 {
             }
         },
     };
-    let cfg = ServerConfig {
-        host: opt(args, "--host").unwrap_or_else(|| "127.0.0.1".into()),
-        port: opt_or(args, "--port", 7379),
-        max_conns: opt_or(args, "--max-conns", 1024),
-    };
+    let mut cfg = ServerConfig::new(
+        opt(args, "--host").unwrap_or_else(|| "127.0.0.1".into()),
+        opt_or(args, "--port", 7379),
+    );
+    cfg.max_conns = opt_or(args, "--max-conns", 1024);
+    cfg.keys_limit = opt_or(args, "--keys-max", 10_000);
+    cfg.max_value_bytes = opt_or::<usize>(args, "--valor-max-mb", 16) << 20;
+    cfg.permitir_sin_clave = has(args, "--sin-clave");
+    // La clave puede venir del entorno para no dejarla en la lista de procesos.
+    cfg.clave = opt(args, "--clave").or_else(|| std::env::var("BITACORA_CLAVE").ok());
+    let segundos = |n: u64| if n == 0 { None } else { Some(Duration::from_secs(n)) };
+    cfg.read_timeout = segundos(opt_or(args, "--timeout-lectura", 300));
+    cfg.write_timeout = segundos(opt_or(args, "--timeout-escritura", 60));
+    // M3: SIGINT y SIGTERM pasan a pedir un apagado ordenado.
+    instalar_senales();
     let t0 = Instant::now();
     let db = match Db::open(opts.clone()) {
         Ok(db) => db,
@@ -113,10 +138,19 @@ fn cmd_serve(args: &[String]) -> i32 {
         st.fsync,
         opts.dir.display()
     );
-    if let Err(e) = serve(Arc::new(db), cfg) {
+    let db = Arc::new(db);
+    if let Err(e) = serve(Arc::clone(&db), cfg) {
         eprintln!("bitacora: servidor: {e}");
         return 1;
     }
+    // M3: apagado ordenado. `close` para el hilo de sincronización, espera a
+    // que acabe una compactación en marcha y hace el fsync final. Sin esto,
+    // Ctrl-C se lo llevaba todo por delante.
+    if let Err(e) = db.close() {
+        eprintln!("bitacora: al cerrar: {e}");
+        return 1;
+    }
+    eprintln!("bitacora: cerrado limpiamente");
     0
 }
 
