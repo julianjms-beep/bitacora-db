@@ -171,13 +171,27 @@ buffer per writer, `shrink_to_fit` after recovery, 8 KB buffered TCP readers.
 
 ### 4. Durability: three policies
 
-| `--fsync` | What it guarantees | SET/s (8 threads) | SET/s (64 threads) |
-|---|---|---|---|
-| `never` | Survives the process being killed; a power cut loses whatever the OS held in cache | 151,000 | — |
-| `group` | Every `OK` means "it is on disk"; `fsync` calls are shared | 48,000 | 69,000 |
-| `always` | `fsync` inside the lock on every write | 27,000 | — |
-| `group --fullfsync` | Also flushes the drive's own cache (`F_FULLFSYNC`) | — | 5,700 |
-| `always --fullfsync` | As paranoid as it gets | 240 | — |
+| `--fsync` | What it guarantees | SET/s | p50 | p99 |
+|---|---|---|---|---|
+| `never` | Survives the process being killed; a power cut loses whatever the OS held in cache | 156k – 166k | 5.4 µs | **1.3 ms** |
+| `always` | `fsync` inside the write lock on every write | 23.8k | 36.8 µs | 139 µs |
+| `group` | Every `OK` means "it is on disk"; `fsync` calls are shared | 49k – 52k | 150 µs | **0.3 – 0.4 ms** |
+| `group --fullfsync` | Also flushes the drive's own cache (`F_FULLFSYNC`) | 1.1k, or 6.6k at 64 threads | 8.0 ms | 12.2 ms |
+
+Ranges are three runs on one laptop, 8 threads, 100 B values. Two of those rows
+are worth a second look, and neither thing is visible in a throughput number:
+
+* **`group` trades median latency for a predictable tail.** `never` has a median
+  28x better and a p99 three to four times *worse*: with no `fsync`, writes pile
+  into the OS cache and the kernel flushes them in bursts. If the worst case is
+  what matters, group commit wins on latency too.
+* **`always` has the worst tail of all, by design** — the `fsync` happens
+  *inside* the write lock, so one slow sync blocks every writer: p99.9 of 44 ms
+  and a measured maximum of **916 ms**, behind a median of 36.8 µs.
+
+Full methodology, read and DELETE figures, behaviour during compaction, index
+RAM, recovery time, and an explicit list of what is *not* measured (including
+why there is no Redis comparison): [docs/RENDIMIENTO.md](docs/RENDIMIENTO.md).
 
 GET: ~1,000,000 ops/s in every mode (an index lookup plus a `pread`). Measured on an
 Apple Silicon MacBook Air with 100 B values, `cargo build --release`.

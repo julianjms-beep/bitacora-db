@@ -140,13 +140,30 @@ recuperación, lectores TCP con buffer de 8 KB.
 
 ### 4. Durabilidad: tres políticas
 
-| `--fsync` | Qué garantiza | SET/s (8 hilos) | SET/s (64 hilos) |
-|---|---|---|---|
-| `never` | Sobrevive a que maten el proceso; un apagón pierde lo que el SO tenía en caché | 151.000 | — |
-| `group` | Cada `OK` significa "está en disco"; los `fsync` se comparten | 48.000 | 69.000 |
-| `always` | `fsync` dentro del candado en cada escritura | 27.000 | — |
-| `group --fullfsync` | Además vacía la caché del propio disco (`F_FULLFSYNC`) | — | 5.700 |
-| `always --fullfsync` | Lo más paranoico posible | 240 | — |
+| `--fsync` | Qué garantiza | SET/s | p50 | p99 |
+|---|---|---|---|---|
+| `never` | Sobrevive a que maten el proceso; un apagón pierde lo que el SO tenía en caché | 156k – 166k | 5,4 µs | **1,3 ms** |
+| `always` | `fsync` dentro del candado en cada escritura | 23,8k | 36,8 µs | 139 µs |
+| `group` | Cada `OK` significa "está en disco"; los `fsync` se comparten | 49k – 52k | 150 µs | **0,3 – 0,4 ms** |
+| `group --fullfsync` | Además vacía la caché del propio disco (`F_FULLFSYNC`) | 1,1k, o 6,6k con 64 hilos | 8,0 ms | 12,2 ms |
+
+Los rangos son de tres tiradas en un portátil, 8 hilos, valores de 100 B. Dos de
+esas filas merecen una segunda mirada, y ninguna de las dos cosas se ve en una
+cifra de rendimiento:
+
+* **`group` cambia latencia media por cola predecible.** `never` tiene una
+  mediana 28 veces mejor y un p99 tres o cuatro veces *peor*: sin `fsync`, las
+  escrituras se acumulan en la caché del sistema y el núcleo las vacía a ratos.
+  Si lo que importa es el peor caso, el group commit gana también en latencia.
+* **`always` tiene la peor cola de todas, y por diseño** — el `fsync` se hace
+  *dentro* del candado de escritura, así que uno lento bloquea a todos los
+  escritores: p99,9 de 44 ms y un máximo medido de **916 ms**, detrás de una
+  mediana de 36,8 µs.
+
+Metodología completa, cifras de lectura y DELETE, comportamiento durante la
+compactación, RAM del índice, tiempo de recuperación y una lista explícita de lo
+que **no** se mide (incluido por qué no hay comparación con Redis):
+[docs/RENDIMIENTO.md](docs/RENDIMIENTO.md).
 
 GET: ~1.000.000 ops/s en todos los modos (es lectura de índice + `pread`).
 Medido en este Mac con valores de 100 B; `cargo build --release`.

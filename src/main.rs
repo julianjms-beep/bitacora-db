@@ -223,10 +223,57 @@ fn cmd_cli(args: &[String]) -> i32 {
     0
 }
 
+/// Percentiles exactos: se guarda la latencia de cada operación y se ordena.
+/// Son 8 bytes por operación —1,6 MB por millón—, asumible, y evita el error de
+/// aproximación de un histograma por cubos. Publicar un p99 aproximado sin
+/// decirlo sería justo el tipo de cifra engañosa que este banco quiere evitar.
+fn percentiles(v: &mut [u64]) -> [u64; 5] {
+    v.sort_unstable();
+    if v.is_empty() {
+        return [0; 5];
+    }
+    let q = |f: f64| v[(((v.len() - 1) as f64) * f).round() as usize];
+    [q(0.50), q(0.95), q(0.99), q(0.999), v[v.len() - 1]]
+}
+
+struct Fase {
+    nombre: &'static str,
+    ops: u64,
+    dur: Duration,
+    lat: Vec<u64>,
+}
+
+impl Fase {
+    fn nueva(nombre: &'static str) -> Fase {
+        Fase {
+            nombre,
+            ops: 0,
+            dur: Duration::ZERO,
+            lat: Vec::new(),
+        }
+    }
+
+    fn imprime(&mut self) {
+        let p = percentiles(&mut self.lat);
+        let us = |n: u64| n as f64 / 1000.0;
+        println!(
+            "{:<22} {:>9.0} ops/s  {:>9.1} {:>9.1} {:>10.1} {:>10.1} {:>10.1}",
+            self.nombre,
+            self.ops as f64 / self.dur.as_secs_f64().max(1e-9),
+            us(p[0]),
+            us(p[1]),
+            us(p[2]),
+            us(p[3]),
+            us(p[4]),
+        );
+    }
+}
+
 fn cmd_bench(args: &[String]) -> i32 {
     let threads: usize = opt_or(args, "--threads", 8);
     let ops: u64 = opt_or(args, "--ops", 200_000);
     let vbytes: usize = opt_or(args, "--value-bytes", 100);
+    let segmb: u64 = opt_or(args, "--segment-mb", 4);
     let fsync = match fsync_opt(args, FsyncPolicy::Never) {
         Ok(f) => f,
         Err(e) => {
@@ -246,86 +293,199 @@ fn cmd_bench(args: &[String]) -> i32 {
     let mut opts = Options::new(&dir);
     opts.fsync = fsync;
     opts.full_fsync = has(args, "--fullfsync");
-    let db = Arc::new(Db::open(opts).expect("abrir bench"));
+    opts.max_segment_bytes = segmb << 20;
+    let db = Arc::new(Db::open(opts.clone()).expect("abrir bench"));
     let per = ops / threads as u64;
+    let total = per * threads as u64;
     let value = vec![b'x'; vbytes];
+    let fs_extra = if opts.full_fsync { " --fullfsync" } else { "" };
 
+    let nucleos = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
     println!(
-        "bitacora bench · {threads} hilos · {ops} ops · valor {vbytes} B · fsync={}",
-        fsync.name()
+        "bitacora bench · {} {} · {nucleos} nucleos · {threads} hilos · {total} ops · valor {vbytes} B · fsync={}{fs_extra} · segmentos de {segmb} MB",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        fsync.name(),
     );
+    println!(
+        "reproducir: bitacora bench --threads {threads} --ops {total} --value-bytes {vbytes} --fsync {}{fs_extra} --segment-mb {segmb}",
+        fsync.name(),
+    );
+    println!();
 
+    // --- SET ---
     let t0 = Instant::now();
     let hs: Vec<_> = (0..threads as u64)
         .map(|t| {
             let db = Arc::clone(&db);
             let value = value.clone();
             thread::spawn(move || {
+                let mut lat = Vec::with_capacity(per as usize);
                 for j in 0..per {
                     let key = format!("k{:010}", t * per + j);
+                    let t1 = Instant::now();
                     db.put(key.as_bytes(), &value).expect("put");
+                    lat.push(t1.elapsed().as_nanos() as u64);
                 }
+                lat
             })
         })
         .collect();
+    let mut set = Fase::nueva("SET");
     for h in hs {
-        h.join().unwrap();
+        set.lat.extend(h.join().unwrap());
     }
-    let set_dt = t0.elapsed();
+    set.dur = t0.elapsed();
+    set.ops = total;
 
-    let t1 = Instant::now();
+    // --- GET cruzado: cada hilo lee las claves de otro, para repartir shards ---
+    let t0 = Instant::now();
     let hs: Vec<_> = (0..threads as u64)
         .map(|t| {
             let db = Arc::clone(&db);
             thread::spawn(move || {
-                let mut found = 0u64;
+                let mut lat = Vec::with_capacity(per as usize);
+                let mut halladas = 0u64;
                 for j in 0..per {
-                    // cada hilo lee claves de otro hilo: lecturas cruzadas entre shards
                     let key = format!("k{:010}", ((t + 1) % threads as u64) * per + j);
-                    if db.get(key.as_bytes()).expect("get").is_some() {
-                        found += 1;
-                    }
+                    let t1 = Instant::now();
+                    let hay = db.get(key.as_bytes()).expect("get").is_some();
+                    lat.push(t1.elapsed().as_nanos() as u64);
+                    halladas += hay as u64;
                 }
-                found
+                (lat, halladas)
             })
         })
         .collect();
-    let mut found = 0;
+    let mut get = Fase::nueva("GET");
+    let mut halladas = 0u64;
     for h in hs {
-        found += h.join().unwrap();
+        let (l, e) = h.join().unwrap();
+        get.lat.extend(l);
+        halladas += e;
     }
-    let get_dt = t1.elapsed();
+    get.dur = t0.elapsed();
+    get.ops = total;
 
-    let st = db.stats();
-    let total = per * threads as u64;
-    println!(
-        "SET  {:>10.0} ops/s   ({:.2} s)",
-        total as f64 / set_dt.as_secs_f64(),
-        set_dt.as_secs_f64()
-    );
-    println!(
-        "GET  {:>10.0} ops/s   ({:.2} s, {found}/{total} encontradas)",
-        total as f64 / get_dt.as_secs_f64(),
-        get_dt.as_secs_f64()
-    );
-    println!(
-        "RAM índice ≈ {:.1} MB para {} claves · disco {:.1} MB en {} segmento(s)",
-        st.index_bytes_est as f64 / 1e6,
-        st.keys,
-        st.disk_bytes as f64 / 1e6,
-        st.segments
-    );
+    // --- GET mientras compacta ---
+    // Antes se generan bytes muertos sobrescribiendo, para que la compactacion
+    // tenga trabajo de verdad: medir "durante compactacion" sobre un log sin
+    // basura daria una cifra bonita y falsa.
+    for j in 0..(total / 4) {
+        let key = format!("k{:010}", j);
+        db.put(key.as_bytes(), &value).expect("put");
+    }
+    let st_antes = db.stats();
+    let compactando = {
+        let db = Arc::clone(&db);
+        thread::spawn(move || db.compact())
+    };
+    let t0 = Instant::now();
+    let hs: Vec<_> = (0..threads as u64)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                let mut lat = Vec::with_capacity((per / 4) as usize);
+                for j in 0..(per / 4) {
+                    let key = format!("k{:010}", ((t + 1) % threads as u64) * per + j);
+                    let t1 = Instant::now();
+                    db.get(key.as_bytes()).expect("get");
+                    lat.push(t1.elapsed().as_nanos() as u64);
+                }
+                lat
+            })
+        })
+        .collect();
+    let mut getc = Fase::nueva("GET con compactacion");
+    for h in hs {
+        getc.lat.extend(h.join().unwrap());
+    }
+    getc.dur = t0.elapsed();
+    getc.ops = getc.lat.len() as u64;
+    let informe = compactando.join().unwrap().expect("compactar");
 
-    let t2 = Instant::now();
+    // --- Reapertura: reconstruccion del indice ---
+    // Se mide AQUI y no al final del banco: despues del DELETE no quedaria
+    // ninguna clave y el numero no diria nada. (La primera version de este
+    // banco informaba de "66 ms para 0 claves", que es exactamente el tipo de
+    // cifra sin sentido que hay que cazar antes de publicarla.)
     drop(db);
-    let db = Db::open_default(&dir).expect("reabrir");
+    let t0 = Instant::now();
+    let db = Arc::new(Db::open(opts.clone()).expect("reabrir"));
+    let dt_reapertura = t0.elapsed();
+    let st_reabierta = db.stats();
+
+    // --- DELETE ---
+    let t0 = Instant::now();
+    let hs: Vec<_> = (0..threads as u64)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                let mut lat = Vec::with_capacity(per as usize);
+                for j in 0..per {
+                    let key = format!("k{:010}", t * per + j);
+                    let t1 = Instant::now();
+                    db.delete(key.as_bytes()).expect("delete");
+                    lat.push(t1.elapsed().as_nanos() as u64);
+                }
+                lat
+            })
+        })
+        .collect();
+    let mut del = Fase::nueva("DELETE");
+    for h in hs {
+        del.lat.extend(h.join().unwrap());
+    }
+    del.dur = t0.elapsed();
+    del.ops = total;
+
     println!(
-        "Reinicio: {} claves reconstruidas en {:.0} ms",
-        db.len(),
-        t2.elapsed().as_secs_f64() * 1000.0
+        "{:<22} {:>15}  {:>9} {:>9} {:>10} {:>10} {:>10}",
+        "fase", "rendimiento", "p50 us", "p95 us", "p99 us", "p99,9 us", "max us"
+    );
+    set.imprime();
+    get.imprime();
+    getc.imprime();
+    del.imprime();
+
+    println!();
+    println!(
+        "indice       {:>8.1} MB para {} claves ({:.0} B/clave)",
+        st_antes.index_bytes_est as f64 / (1 << 20) as f64,
+        st_antes.keys,
+        st_antes.index_bytes_est as f64 / st_antes.keys.max(1) as f64
+    );
+    println!(
+        "disco        {:>8.1} MB en {} segmentos · {:.1} MB vivos / {:.1} MB muertos antes de compactar",
+        st_antes.disk_bytes as f64 / (1 << 20) as f64,
+        st_antes.segments,
+        st_antes.live_bytes as f64 / (1 << 20) as f64,
+        st_antes.dead_bytes as f64 / (1 << 20) as f64
+    );
+    println!(
+        "compactacion {:>8} segmentos retirados · {:.1} MB -> {:.1} MB",
+        informe.segments_removed,
+        informe.bytes_before as f64 / (1 << 20) as f64,
+        informe.bytes_after as f64 / (1 << 20) as f64
+    );
+    println!("GET          {halladas} de {total} claves encontradas");
+
+    println!(
+        "reapertura   {:>8.0} ms para {} claves ({:.0} claves/s) · salud: {}",
+        dt_reapertura.as_secs_f64() * 1000.0,
+        st_reabierta.keys,
+        st_reabierta.keys as f64 / dt_reapertura.as_secs_f64().max(1e-9),
+        st_reabierta.health
     );
     drop(db);
-    let _ = std::fs::remove_dir_all(&dir);
+
+    if has(args, "--conservar") {
+        println!("\ndatos en {}", dir.display());
+    } else if let Err(e) = std::fs::remove_dir_all(&dir) {
+        eprintln!("aviso: no se pudo borrar {}: {e}", dir.display());
+    }
     0
 }
 
