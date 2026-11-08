@@ -1,36 +1,73 @@
-# BITÁCORA · motor de base de datos clave-valor desde cero
+# BITÁCORA · a key-value storage engine written from scratch
 
-Motor de almacenamiento clave-valor escrito en **Rust sin ninguna dependencia
-externa** (solo la librería estándar). Resuelve los tres retos del enunciado:
+A persistent key-value store in **Rust with zero external dependencies** — standard
+library only. Write-ahead log, CRC-32 per record, in-memory index sharded 64 ways,
+group-commit `fsync`, concurrent compaction, TCP text protocol.
 
-| Reto | Cómo se resuelve | Dónde |
-|---|---|---|
-| Concurrencia a nivel de SO | Un hilo del sistema por conexión TCP; índice partido en 64 *shards* con `RwLock`; escritor único con `Mutex`; *group commit* con hilo de sincronización | `src/server.rs`, `src/store.rs` |
-| No corromperse si se va la luz | WAL *append-only* con CRC-32 por registro; al arrancar se recorta la cola rota; `fsync` configurable | `src/wal.rs`, `src/store.rs` |
-| Optimizar la RAM | Los valores viven en disco, en memoria solo `clave → (fichero, posición, longitud, seq)` (24 bytes + clave); lectura con `pread` sin copias intermedias; compactación que recicla espacio | `src/store.rs` |
+*Bitácora* is Spanish for a ship's logbook: entries are appended in order and never
+erased. It is the natural translation of *log*, which is the heart of the design.
 
-Nombre: *bitácora* es la traducción natural de *log*, que es el corazón del diseño.
+[Léeme en español](README.es.md)
 
 ---
 
-## Arrancar
+## The 30-second version
 
-Requisitos: Rust (`cargo`). Nada más.
+Store three keys, kill the process with `SIGKILL` mid-flight, start it again:
+
+```console
+$ bitacora serve --dir data --port 7399 &
+$ printf 'SET name Carlos\nSET city Madrid\nSET goals 41\nQUIT\n' | nc 127.0.0.1 7399
+OK
+OK
+OK
+BYE
+
+$ kill -9 %1          # pull the plug
+
+$ bitacora serve --dir data --port 7399 &
+$ printf 'GET name\nGET goals\nKEYS\nQUIT\n' | nc 127.0.0.1 7399
+VAL Carlos
+VAL 41
+KEYS 3
+city
+goals
+name
+BYE
+```
+
+Every `OK` you received is still there. That guarantee — and what it costs — is what
+this repository is about.
+
+## Design goals
+
+| Goal | How it is met | Where |
+|---|---|---|
+| OS-level concurrency | One OS thread per TCP connection; index split into 64 shards behind `RwLock`; single writer behind `Mutex`; group commit with a dedicated sync thread | `src/server.rs`, `src/store.rs` |
+| Never corrupt on power loss | Append-only WAL with a CRC-32 per record; a torn tail is truncated at startup; configurable `fsync` | `src/wal.rs`, `src/store.rs` |
+| Keep RAM proportional to keys, not data | Values live on disk; memory holds only `key → (file, offset, length, seq)` (24 bytes + key); reads are a single `pread`; compaction reclaims space | `src/store.rs` |
+
+---
+
+## Quick start
+
+Requirements: Rust (`cargo`). Nothing else.
 
 ```bash
-cd ~/Projects/bitacora-db
+git clone https://github.com/<user>/bitacora-db
+cd bitacora-db
 cargo build --release
 
-# servidor (crea ./data)
+# server (creates ./data)
 ./target/release/bitacora serve --dir data --port 7379 --fsync group
 
-# en otra terminal: cliente propio…
+# in another terminal: the bundled client…
 ./target/release/bitacora cli
-# …o cualquier cliente de texto
+# …or any text client
 nc 127.0.0.1 7379
 ```
 
-Sesión de ejemplo con `nc`:
+The protocol is one command per line:
 
 ```
 SET user:1 Ana Garcia      → OK
@@ -39,30 +76,30 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
-STATS                      → STATS 10  /  keys 0 / segments 1 / ... / synced_seq 3
+STATS                      → STATS 10  /  keys 0 / segments 1 / … / synced_seq 3
 COMPACT                    → OK segmentos_retirados=1 bytes_antes=132 bytes_despues=68
 PING                       → PONG
 QUIT                       → BYE
 ```
 
-Opciones de `serve`: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
-`--fullfsync`, `--segment-mb` (tamaño de cada fichero de log), `--max-conns`.
+`serve` options: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
+`--fullfsync`, `--segment-mb` (size of each log file), `--max-conns`.
 
-Pruebas y benchmark:
+Tests and benchmark:
 
 ```bash
-cargo test                                   # 17 pruebas (unitarias + integración)
+cargo test                                   # 17 tests (unit + integration)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
 ---
 
-## Cómo funciona
+## How it works
 
-### 1. El disco: un log que solo crece (WAL)
+### 1. On disk: a log that only grows
 
-Toda operación se escribe **al final** de un fichero (`data/000001.log`,
-`000002.log`, …). Nunca se modifica nada in situ. Un registro:
+Every operation is appended to the **end** of a file (`data/000001.log`,
+`000002.log`, …). Nothing is ever modified in place. One record:
 
 ```
 ┌────────┬────────┬─────────┬─────────┬──────┬───────┬───────┐
@@ -71,141 +108,135 @@ Toda operación se escribe **al final** de un fichero (`data/000001.log`,
 └────────┴────────┴─────────┴─────────┴──────┴───────┴───────┘
 ```
 
-* `crc32` cubre todo lo que va detrás (implementación propia, `src/crc32.rs`).
-* `seq` es un contador global y creciente. Permite reconstruir el estado **sin
-  depender del orden de los ficheros**, y por eso la compactación puede escribir
-  en ficheros nuevos sin romper nada.
-* `kind` = PUT o DEL (una *lápida*: el borrado también es un registro, porque
-  nunca borramos nada del log directamente).
+* `crc32` covers everything that follows it (own implementation, `src/crc32.rs`).
+* `seq` is a global, monotonic counter. State can be rebuilt **without depending on
+  file order**, which is why compaction can write into fresh files without breaking
+  anything.
+* `kind` is PUT or DEL — a *tombstone*: a delete is also a record, because nothing is
+  ever removed from the log directly.
 
-**Qué pasa si se va la luz a mitad de una escritura.** El último registro queda
-a medias. Al arrancar, el lector (`SegmentReader`) comprueba longitud y CRC de
-cada registro; en cuanto uno no cuadra, considera que ahí acabó lo útil, recorta
-el fichero en ese byte y sigue. Todo lo anterior se conserva intacto. La prueba
-`sobrevive_a_un_kill_9_a_mitad_de_escritura` lanza el binario escribiendo a toda
-velocidad, lo mata con `SIGKILL` tres veces y comprueba que las claves
-recuperadas son exactamente un prefijo `k0..k(n-1)` con sus valores correctos:
-ni huecos, ni basura.
+**What happens when the power goes out mid-write.** The last record is left
+half-written. At startup the reader (`SegmentReader`) checks the length and CRC of
+every record; the first one that does not add up is treated as the end of useful
+data, the file is truncated at that byte, and startup continues. Everything before it
+is intact. The test `sobrevive_a_un_kill_9_a_mitad_de_escritura` launches the binary
+writing at full speed, kills it with `SIGKILL` three times, and asserts that the
+recovered keys are exactly a prefix `k0..k(n-1)` with the right values: no holes, no
+garbage.
 
-### 2. La memoria: índice sin valores
+### 2. In memory: an index without values
 
 ```rust
 struct Loc { file_id: u32, vlen: u32, vpos: u64, seq: u64 }   // 24 bytes
-HashMap<Box<[u8]>, Loc>                                        // clave → Loc
+HashMap<Box<[u8]>, Loc>                                        // key → Loc
 ```
 
-Al leer, se busca la clave en el índice y se hace **un solo `pread`** del valor
-en la posición exacta del fichero (`read_exact_at`): sin buscar en el fichero,
-sin leer de más, sin candado sobre el fichero (cada hilo lee con su propia
-posición). El SO cachea en su *page cache* lo que se usa a menudo, así que la
-RAM del proceso crece con el número de claves y no con el tamaño de los datos.
+A read looks the key up in the index and issues **a single `pread`** for the value at
+its exact offset (`read_exact_at`): no scanning, no over-reading, and no lock on the
+file — each thread reads with its own offset. The OS keeps hot data in its page
+cache, so process RAM grows with the number of keys, not with the size of the data.
 
-Medido: 200.000 claves con valores de 100 B → **11,8 MB de índice** frente a
-26 MB de datos; el reinicio reconstruye las 200.000 claves en **~130 ms**.
+Measured: 200,000 keys with 100 B values → **11.8 MB of index** against 26 MB of
+data; a restart rebuilds all 200,000 keys in **~130 ms**.
 
-Detalles que ahorran memoria: claves como `Box<[u8]>` (sin capacidad sobrante
-de `Vec`), un solo buffer reutilizado por escritor, `shrink_to_fit` tras la
-recuperación, lectores TCP con buffer de 8 KB.
+Details that save memory: keys as `Box<[u8]>` (no spare `Vec` capacity), one reusable
+buffer per writer, `shrink_to_fit` after recovery, 8 KB buffered TCP readers.
 
-### 3. La concurrencia: hilos de verdad
+### 3. Concurrency: real threads
 
-* **Servidor**: `TcpListener` + `thread::spawn` por conexión. Son hilos del
-  sistema operativo planificados por el kernel; no hay *runtime* async. Todas
-  las conexiones comparten la misma `Db` mediante `Arc`.
-* **Lecturas**: el índice está partido en 64 *shards*, cada uno con su
-  `RwLock`. Dos lecturas de claves distintas casi nunca compiten por el mismo
-  candado, y los lectores **nunca** tocan el candado de escritura.
-* **Escrituras**: el log es secuencial por naturaleza, así que hay un único
-  `Mutex<Writer>`. Dentro del candado: codificar, `write`, actualizar el índice.
-  Mantener la actualización del índice dentro del mismo candado garantiza que
-  el orden del índice coincide con el orden del log (la prueba
-  `clave_caliente_memoria_y_log_coinciden` machaca una clave desde 8 hilos y
-  comprueba que, tras reiniciar, la memoria y el log dicen lo mismo).
-* **Group commit**: con `--fsync group`, un `put` escribe su registro, suelta
-  el candado y espera en una `Condvar` a que un hilo de sincronización haga el
-  `fsync`. Ese hilo sincroniza **una vez** y despierta a todos los que esperaban:
-  cien escritores concurrentes comparten un solo `fsync`. El `fsync` se hace
-  fuera del candado de escritura para no frenar a los demás.
-* **Compactación concurrente**: reescribe solo los registros vivos de los
-  segmentos cerrados a segmentos nuevos **mientras siguen entrando lecturas y
-  escrituras**. Para cada registro comprueba que el índice aún apunta a él, lo
-  copia y, bajo el candado del shard, mueve el puntero solo si nadie ha escrito
-  esa clave entretanto (*compare-and-swap* manual). Los ficheros viejos se
-  retiran primero del mapa y luego del disco: un lector que ya tuviera el
-  descriptor sigue leyendo bien; uno que llegue después vuelve a mirar el índice.
+* **Server**: `TcpListener` + `thread::spawn` per connection. These are OS threads
+  scheduled by the kernel; there is no async runtime. All connections share one `Db`
+  through an `Arc`.
+* **Reads**: the index is split into 64 shards, each with its own `RwLock`. Two reads
+  of different keys almost never contend on the same lock, and readers **never** touch
+  the write lock.
+* **Writes**: the log is sequential by nature, so there is a single `Mutex<Writer>`.
+  Inside the lock: encode, `write`, update the index. Keeping the index update inside
+  the same lock guarantees that index order matches log order (the test
+  `clave_caliente_memoria_y_log_coinciden` hammers one key from 8 threads and checks
+  that after a restart memory and log agree).
+* **Group commit**: with `--fsync group`, a `put` writes its record, releases the
+  lock, and waits on a `Condvar` for a sync thread to run the `fsync`. That thread
+  syncs **once** and wakes everyone waiting: a hundred concurrent writers share a
+  single `fsync`. The `fsync` happens outside the write lock so it does not stall
+  other writers.
+* **Concurrent compaction**: live records from closed segments are rewritten into new
+  segments **while reads and writes keep coming in**. For each record it verifies that
+  the index still points at it, copies it, and — under the shard lock — moves the
+  pointer only if nobody wrote that key in the meantime (a hand-rolled
+  compare-and-swap). Old files are removed from the map first and from disk second: a
+  reader already holding the descriptor keeps reading correctly, and one arriving
+  later consults the index again.
 
-### 4. Durabilidad: tres políticas
+### 4. Durability: three policies
 
-| `--fsync` | Qué garantiza | SET/s (8 hilos) | SET/s (64 hilos) |
+| `--fsync` | What it guarantees | SET/s (8 threads) | SET/s (64 threads) |
 |---|---|---|---|
-| `never` | Sobrevive a que maten el proceso; un apagón pierde lo que el SO tenía en caché | 151.000 | — |
-| `group` | Cada `OK` significa "está en disco"; los `fsync` se comparten | 48.000 | 69.000 |
-| `always` | `fsync` dentro del candado en cada escritura | 27.000 | — |
-| `group --fullfsync` | Además vacía la caché del propio disco (`F_FULLFSYNC`) | — | 5.700 |
-| `always --fullfsync` | Lo más paranoico posible | 240 | — |
+| `never` | Survives the process being killed; a power cut loses whatever the OS held in cache | 151,000 | — |
+| `group` | Every `OK` means "it is on disk"; `fsync` calls are shared | 48,000 | 69,000 |
+| `always` | `fsync` inside the lock on every write | 27,000 | — |
+| `group --fullfsync` | Also flushes the drive's own cache (`F_FULLFSYNC`) | — | 5,700 |
+| `always --fullfsync` | As paranoid as it gets | 240 | — |
 
-GET: ~1.000.000 ops/s en todos los modos (es lectura de índice + `pread`).
-Medido en este Mac con valores de 100 B; `cargo build --release`.
+GET: ~1,000,000 ops/s in every mode (an index lookup plus a `pread`). Measured on an
+Apple Silicon MacBook Air with 100 B values, `cargo build --release`.
 
-Nota macOS: `fsync()` en macOS manda los datos al disco pero no obliga al disco
-a vaciar su propia caché; para eso existe `F_FULLFSYNC`. La librería estándar de
-Rust usa siempre `F_FULLFSYNC`, por eso el motor llama directamente a `fsync()`
-del sistema y deja el completo detrás de `--fullfsync`. La fila de 64 hilos
-muestra lo que aporta el group commit: 240 → 5.700 escrituras/s con la misma
-garantía, porque cada `F_FULLFSYNC` (≈4 ms) sirve a ~24 escrituras a la vez.
+A note on macOS: `fsync()` sends data to the drive but does not force the drive to
+flush its own cache — that is what `F_FULLFSYNC` is for. The Rust standard library
+always uses `F_FULLFSYNC`, so this engine calls the system's `fsync()` directly and
+leaves the full flush behind `--fullfsync`. The 64-thread row is what group commit
+buys you: 240 → 5,700 writes/s at the same guarantee, because each `F_FULLFSYNC`
+(≈4 ms) serves about 24 writes at once.
 
-### 5. Compactación
+### 5. Compaction
 
-Las claves sobrescritas y las borradas dejan registros muertos en el log. Cuando
-los bytes muertos superan el 50 % (y 16 MB) al cerrar un segmento, se lanza una
-compactación en segundo plano; también se puede pedir con `COMPACT`. Las
-lápidas se descartan al compactar porque siempre se compactan **todos** los
-segmentos cerrados a la vez, así que ningún PUT antiguo puede "resucitar"
-(prueba `borrados_sobreviven_a_compactacion_y_reinicio`).
+Overwritten and deleted keys leave dead records in the log. When dead bytes pass 50%
+(and 16 MB) as a segment is closed, a background compaction starts; it can also be
+requested with `COMPACT`. Tombstones are dropped during compaction because **all**
+closed segments are always compacted together, so no old PUT can be resurrected
+(test `borrados_sobreviven_a_compactacion_y_reinicio`).
 
 ---
 
-## Estructura
+## Layout
 
 ```
-src/crc32.rs     CRC-32 propio (tabla en tiempo de compilación)
-src/wal.rs       formato de registro, codificador, lector con detección de cola rota
-src/store.rs     el motor: índice por shards, segmentos, group commit, compactación
-src/protocol.rs  parser del protocolo de texto
-src/server.rs    TCP, un hilo por conexión
+src/crc32.rs     own CRC-32 (table built at compile time)
+src/wal.rs       record format, encoder, reader with torn-tail detection
+src/store.rs     the engine: sharded index, segments, group commit, compaction
+src/protocol.rs  text protocol parser
+src/server.rs    TCP, one thread per connection
 src/main.rs      serve / cli / bench
-tests/           recuperación (kill -9, cola rota, bit corrupto) y concurrencia
+tests/           recovery (kill -9, torn tail, flipped bit) and concurrency
 ```
 
-## Pruebas (17)
+## Tests (17)
 
-* `crc32`: vector estándar, cálculo por trozos.
-* `wal`: ida y vuelta, cola cortada, bit cambiado.
-* `protocol`: parseo y errores.
-* Recuperación: **`kill -9` real** a mitad de escritura (×3), cola rota se
-  recorta, un bit corrupto descarta solo ese registro, borrados + compactación +
-  reinicio, claves/valores binarios y límites.
-* Concurrencia: 8 hilos × 3.000 escrituras con lecturas cruzadas y reinicio,
-  clave caliente desde 8 hilos coherente con el log, compactación mientras se
-  escribe y se lee, group commit con 16 hilos (`synced_seq == last_seq` al final).
+* `crc32`: standard vector, chunked computation.
+* `wal`: round trip, truncated tail, flipped bit.
+* `protocol`: parsing and errors.
+* Recovery: a **real `kill -9`** mid-write (×3), torn tail truncated, a corrupt bit
+  discarding only that record, deletes + compaction + restart, binary keys and values,
+  and size limits.
+* Concurrency: 8 threads × 3,000 writes with interleaved reads and a restart, one hot
+  key from 8 threads staying consistent with the log, compaction while reading and
+  writing, group commit with 16 threads (`synced_seq == last_seq` at the end).
 
-## Decisiones y límites (para defenderlo)
+## Design decisions and limits
 
-* **¿Por qué Rust?** Hilos nativos del SO, sin recolector de basura (la RAM es
-  la que se ve), control explícito de `fsync`, y el compilador impide carreras de
-  datos: cada acceso compartido pasa por `Mutex`/`RwLock`/atómicos.
-* **¿Por qué estilo Bitcask (índice en RAM, valores en disco) y no un B-tree o
-  LSM?** Es el diseño más simple que da escrituras secuenciales, una sola
-  lectura de disco por `GET` y recuperación trivial. El coste: hay que poder
-  tener todas las claves en RAM, y el arranque lee todo el log (200k claves en
-  ~130 ms; a 50 M claves habría que añadir *hint files*).
-* **Visibilidad vs durabilidad**: con `group`, una escritura es visible para
-  otros hilos en cuanto entra en el índice, pero el cliente solo recibe `OK`
-  cuando está en disco. Es el mismo compromiso que hacen Redis (AOF `everysec`) y
-  la mayoría de motores con group commit.
-* **Protocolo de texto por líneas**: los valores no pueden contener saltos de
-  línea (en la API Rust sí, es binaria). Elegido para poder probarlo con `nc`.
-* **Un hilo por conexión** escala a cientos de clientes, no a cien mil; para
-  eso habría que pasar a un *pool* o a `epoll/kqueue`. Está limitado por
-  `--max-conns`.
-* **Sin transacciones multi-clave ni TTL**: fuera del alcance del enunciado.
+* **Why Rust?** Native OS threads, no garbage collector (the RAM you see is the RAM
+  you have), explicit control over `fsync`, and a compiler that rules out data races:
+  every shared access goes through `Mutex`/`RwLock`/atomics.
+* **Why Bitcask-style (index in RAM, values on disk) instead of a B-tree or an LSM
+  tree?** It is the simplest design that gives sequential writes, a single disk read
+  per `GET`, and trivial recovery. The cost: every key must fit in RAM, and startup
+  reads the whole log (200k keys in ~130 ms; at 50M keys this would need hint files).
+* **Visibility vs durability**: with `group`, a write becomes visible to other threads
+  as soon as it enters the index, but the client only gets `OK` once it is on disk.
+  This is the same trade-off Redis makes with AOF `everysec`, and most engines with
+  group commit.
+* **Line-based text protocol**: values cannot contain newlines over the wire (the Rust
+  API is binary and has no such limit). Chosen so the server can be driven with `nc`.
+* **One thread per connection** scales to hundreds of clients, not a hundred thousand;
+  that would call for a thread pool or `epoll`/`kqueue`. Bounded by `--max-conns`.
+* **No multi-key transactions and no TTL** — deliberately out of scope.
