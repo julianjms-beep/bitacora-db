@@ -43,13 +43,31 @@ pub fn serve(db: Arc<Db>, cfg: ServerConfig) -> io::Result<()> {
         thread::Builder::new()
             .name("bitacora-conn".into())
             .spawn(move || {
-                if let Err(e) = handle(&db, stream) {
-                    if !matches!(
-                        e.kind(),
-                        io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-                    ) {
-                        eprintln!("bitacora: conexión cerrada con error: {e}");
+                // A6: un panic aquí envenenaría los candados del motor y, peor,
+                // se saltaría el decremento del contador de conexiones, así que
+                // el límite se iría agotando solo hasta dejar el servidor
+                // inaccesible. Atrapándolo, el daño se queda en esta conexión.
+                //
+                // `AssertUnwindSafe` está justificado: tras el panic no se
+                // vuelve a tocar nada desde este cierre, y los candados del
+                // motor se recuperan del envenenamiento (ver `store::lk`).
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle(&db, stream)
+                }));
+                match r {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if !matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                        ) {
+                            eprintln!("bitacora: conexión cerrada con error: {e}");
+                        }
                     }
+                    Err(_) => eprintln!(
+                        "bitacora: una conexión entró en panic; se cierra solo esa conexión. \
+                         El estado en memoria puede haber quedado a medias: conviene reiniciar"
+                    ),
                 }
                 conns.fetch_sub(1, Ordering::Relaxed);
             })?;

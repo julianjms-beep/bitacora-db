@@ -24,9 +24,36 @@ use std::io::{self, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Toma un `Mutex` recuperándose del envenenamiento.
+///
+/// A6: con `.lock().unwrap()`, un único panic con el candado tomado convierte
+/// el proceso en inservible, porque todas las operaciones posteriores entran en
+/// panic al tocar ese candado. En un servidor eso transforma un fallo aislado
+/// en una caída total que además sigue aceptando conexiones.
+///
+/// **Límite honesto:** si el hilo que entró en panic dejó el estado a medias,
+/// sigue a medias. Recuperarse evita la cascada; no arregla los datos. Tras un
+/// panic conviene reiniciar. El servidor además atrapa el panic en el borde de
+/// cada conexión, para que en el caso habitual no llegue a envenenar nada.
+fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Lectura compartida de un `RwLock`, recuperándose del envenenamiento. Ver [`lk`].
+fn rd<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Escritura exclusiva de un `RwLock`, recuperándose del envenenamiento. Ver [`lk`].
+fn wr<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsyncPolicy {
@@ -138,6 +165,10 @@ pub struct Options {
     pub compact_dead_ratio: f64,
     /// Qué hacer ante corrupción al abrir. Ver [`RecoveryPolicy`].
     pub recovery: RecoveryPolicy,
+    /// Plazo máximo que `get` reintenta cuando la compactación acaba de
+    /// retirar el segmento al que apuntaba el índice. Agotarlo indica un fallo
+    /// interno, no una clave ausente.
+    pub read_retry_timeout: Duration,
     /// **Inyección de fallos, solo para pruebas.** Hace que el `fsync` número
     /// `N+1` falle, para poder comprobar qué hace el motor cuando el disco
     /// falla de verdad. En producción se deja en `None`.
@@ -158,6 +189,7 @@ impl Options {
             compact_min_dead_bytes: 16 << 20,
             compact_dead_ratio: 0.5,
             recovery: RecoveryPolicy::Estricto,
+            read_retry_timeout: Duration::from_secs(2),
             fsync_falla_tras: None,
         }
     }
@@ -211,7 +243,7 @@ struct Shard {
 
 impl Shard {
     fn set(&self, key: &[u8], loc: Loc) -> Option<Loc> {
-        let mut m = self.map.write().unwrap();
+        let mut m = wr(&self.map);
         match m.get_mut(key) {
             Some(e) => Some(std::mem::replace(e, loc)),
             None => {
@@ -330,14 +362,26 @@ fn validate(key: &[u8], value: Option<&[u8]>) -> io::Result<()> {
         ));
     }
     if let Some(v) = value {
-        if v.len() >= MAX_VALUE {
+        // M8: el lector acepta `vlen <= MAX_VALUE`, así que el escritor tiene
+        // que rechazar exactamente lo mismo. Antes rechazaba `>=`, de modo que
+        // un valor de 1 GiB justos era ilegal al escribir y legal al leer.
+        if v.len() > MAX_VALUE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "valor de 1 GiB o más",
+                "valor de más de 1 GiB",
             ));
         }
     }
     Ok(())
+}
+
+/// Resta sin poder envolverse por abajo. M2: `fetch_sub` a secas podía dejar el
+/// contador en 18 exabytes si dos hilos descontaban el mismo registro, y esos
+/// contadores deciden cuándo se compacta.
+fn sub_sat(a: &AtomicU64, v: u64) {
+    let _ = a.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(v))
+    });
 }
 
 /// En macOS la librería estándar de Rust convierte `sync_data`/`sync_all` en
@@ -440,10 +484,10 @@ impl Db {
             let path = seg_path(&opts.dir, id);
             let file = Arc::new(open_segment(&opts.dir, id)?);
             let mut len = file.metadata()?.len();
-            let mut rd =
+            let mut lector =
                 SegmentReader::new(BufReader::with_capacity(1 << 16, file.try_clone()?), len);
             loop {
-                match rd.next()? {
+                match lector.next()? {
                     ReadOutcome::End => break,
                     ReadOutcome::IncompleteTail { at, cause } => {
                         report.truncated_tails.push((path.clone(), at));
@@ -479,7 +523,7 @@ impl Db {
                         let vlen = if r.kind == Kind::Put { r.value.len() as u32 } else { TOMB };
                         let loc = Loc { file_id: id, vlen, vpos: r.vpos, seq: r.seq };
                         let sh = &shards[(fnv1a(&r.key) as usize) % nsh];
-                        let mut m = sh.map.write().unwrap();
+                        let mut m = wr(&sh.map);
                         match m.get_mut(&r.key[..]) {
                             Some(e) => {
                                 if r.seq > e.seq {
@@ -560,7 +604,7 @@ impl Db {
         // Las lápidas ya han hecho su trabajo: fuera del índice.
         let mut live = 0u64;
         for s in &shards {
-            let mut m = s.map.write().unwrap();
+            let mut m = wr(&s.map);
             m.retain(|_, l| l.vlen != TOMB);
             for (k, l) in m.iter() {
                 live += rec_len(k.len(), l.vlen);
@@ -625,7 +669,7 @@ impl Db {
         inner.check_writable()?;
         let seq;
         {
-            let mut w = inner.writer.lock().unwrap();
+            let mut w = lk(&inner.writer);
             let rlen = rec_len(key.len(), value.len() as u32);
             if w.len > 0 && w.len + rlen > inner.opts.max_segment_bytes {
                 self.inner.roll(&mut w)?;
@@ -638,9 +682,19 @@ impl Db {
                 wal::encode(buf, seq, Kind::Put, key, value);
                 let mut f: &File = &**file;
                 if let Err(e) = f.write_all(buf) {
-                    // Escritura a medias: deshacerla para no dejar basura delante
-                    // de los registros siguientes.
-                    let _ = file.set_len(start);
+                    // Escritura a medias. Hay que deshacerla, porque dejar un
+                    // registro roto en MEDIO del log hace que al reabrir se
+                    // pierda todo lo posterior (ver docs/RECUPERACION.md).
+                    if let Err(e2) = file.set_len(start) {
+                        // A1: no se ha podido deshacer. Seguir escribiendo en
+                        // este segmento garantizaría basura intermedia, así que
+                        // la base deja de aceptar escrituras.
+                        inner.mark_failed(&e2);
+                        return Err(inner.no_escribible(&format!(
+                            "no se pudo deshacer una escritura parcial en el byte {start}: \
+                             {e2} (el fallo original fue: {e})"
+                        )));
+                    }
                     return Err(e);
                 }
             }
@@ -660,7 +714,7 @@ impl Db {
             inner.live.fetch_add(rlen, Ordering::Relaxed);
             if let Some(o) = old {
                 let ol = rec_len(key.len(), o.vlen);
-                inner.live.fetch_sub(ol, Ordering::Relaxed);
+                sub_sat(&inner.live, ol);
                 inner.dead.fetch_add(ol, Ordering::Relaxed);
             }
         }
@@ -673,27 +727,43 @@ impl Db {
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let inner = &*self.inner;
         let shard = inner.shard(key);
-        for _ in 0..32 {
-            let loc = match shard.map.read().unwrap().get(key) {
+        // La compactación puede retirar un segmento entre que se consulta el
+        // índice y que se abre el fichero. El índice ya apunta al sitio nuevo,
+        // así que basta con volver a mirar.
+        //
+        // M1: antes eran 32 vueltas de espera activa y, al agotarlas, un error
+        // genérico aunque el dato existiera. Ahora hay un plazo de verdad, se
+        // cede la CPU en vez de quemarla, y el error dice que es un fallo
+        // interno y no una clave ausente.
+        let limite = Instant::now() + inner.opts.read_retry_timeout;
+        let mut vueltas = 0u32;
+        loop {
+            let loc = match rd(&shard.map).get(key) {
                 Some(l) => *l,
                 None => return Ok(None),
             };
-            let file = match inner.segments.read().unwrap().get(&loc.file_id) {
-                Some(f) => Arc::clone(f),
-                // La compactación acaba de retirar ese segmento: el índice ya
-                // apunta al nuevo sitio, basta con volver a mirar.
-                None => {
-                    thread::yield_now();
-                    continue;
+            if let Some(file) = rd(&inner.segments).get(&loc.file_id).map(Arc::clone) {
+                let mut buf = vec![0u8; loc.vlen as usize];
+                if loc.vlen > 0 {
+                    file.read_exact_at(&mut buf, loc.vpos)?;
                 }
-            };
-            let mut buf = vec![0u8; loc.vlen as usize];
-            if loc.vlen > 0 {
-                file.read_exact_at(&mut buf, loc.vpos)?;
+                return Ok(Some(buf));
             }
-            return Ok(Some(buf));
+            vueltas += 1;
+            if Instant::now() >= limite {
+                return Err(io::Error::other(format!(
+                    "fallo interno: la clave está en el índice pero su segmento \
+                     ({}) desapareció y no reapareció en {:?} ({vueltas} intentos). \
+                     Esto no significa que la clave no exista",
+                    loc.file_id, inner.opts.read_retry_timeout
+                )));
+            }
+            if vueltas < 64 {
+                thread::yield_now();
+            } else {
+                thread::sleep(Duration::from_micros(200));
+            }
         }
-        Err(io::Error::new(io::ErrorKind::Other, "segmento desaparecido durante la lectura"))
     }
 
     /// Qué pasó al reconstruir el índice al abrir: registros leídos, zonas
@@ -704,7 +774,7 @@ impl Db {
     }
 
     pub fn exists(&self, key: &[u8]) -> bool {
-        self.inner.shard(key).map.read().unwrap().contains_key(key)
+        rd(&self.inner.shard(key).map).contains_key(key)
     }
 
     /// Devuelve `true` si la clave existía. Escribe una lápida en el log.
@@ -714,9 +784,9 @@ impl Db {
         inner.check_writable()?;
         let seq;
         {
-            let mut w = inner.writer.lock().unwrap();
+            let mut w = lk(&inner.writer);
             let shard = inner.shard(key);
-            let old = match shard.map.read().unwrap().get(key) {
+            let old = match rd(&shard.map).get(key) {
                 Some(l) => *l,
                 None => return Ok(false),
             };
@@ -732,7 +802,14 @@ impl Db {
                 wal::encode(buf, seq, Kind::Del, key, &[]);
                 let mut f: &File = &**file;
                 if let Err(e) = f.write_all(buf) {
-                    let _ = file.set_len(start);
+                    // Mismo razonamiento que en `put`: ver A1.
+                    if let Err(e2) = file.set_len(start) {
+                        inner.mark_failed(&e2);
+                        return Err(inner.no_escribible(&format!(
+                            "no se pudo deshacer una lápida parcial en el byte {start}: \
+                             {e2} (el fallo original fue: {e})"
+                        )));
+                    }
                     return Err(e);
                 }
             }
@@ -742,9 +819,9 @@ impl Db {
                 inner.sync_file_or_fail(&w.file)?;
                 inner.mark_synced(seq);
             }
-            shard.map.write().unwrap().remove(key);
+            wr(&shard.map).remove(key);
             let ol = rec_len(key.len(), old.vlen);
-            inner.live.fetch_sub(ol, Ordering::Relaxed);
+            sub_sat(&inner.live, ol);
             inner.dead.fetch_add(ol + rlen, Ordering::Relaxed);
         }
         if inner.opts.fsync == FsyncPolicy::Group {
@@ -757,7 +834,7 @@ impl Db {
     pub fn keys(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         for s in &self.inner.shards {
-            let m = s.map.read().unwrap();
+            let m = rd(&s.map);
             for k in m.keys() {
                 if k.starts_with(prefix) {
                     out.push(k.to_vec());
@@ -769,7 +846,7 @@ impl Db {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.shards.iter().map(|s| s.map.read().unwrap().len()).sum()
+        self.inner.shards.iter().map(|s| rd(&s.map).len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -781,14 +858,14 @@ impl Db {
         let mut keys = 0u64;
         let mut key_bytes = 0u64;
         for s in &inner.shards {
-            let m = s.map.read().unwrap();
+            let m = rd(&s.map);
             keys += m.len() as u64;
             for k in m.keys() {
                 key_bytes += k.len() as u64;
             }
         }
         let (segments, disk_bytes) = {
-            let segs = inner.segments.read().unwrap();
+            let segs = rd(&inner.segments);
             let disk = segs
                 .values()
                 .map(|f| f.metadata().map(|m| m.len()).unwrap_or(0))
@@ -797,8 +874,8 @@ impl Db {
         };
         // Ambos bajo el candado de escritura: así `synced_seq <= last_seq` siempre.
         let (last_seq, synced_seq, health) = {
-            let w = inner.writer.lock().unwrap();
-            let s = inner.synced.lock().unwrap();
+            let w = lk(&inner.writer);
+            let s = lk(&inner.synced);
             let health = match &s.failed {
                 None => "ok".to_string(),
                 Some(m) => format!("no-escribible ({m})"),
@@ -837,17 +914,17 @@ impl Db {
         let inner = &*self.inner;
         inner.stop.store(true, Ordering::Release);
         {
-            let mut r = inner.sync_req.lock().unwrap();
+            let mut r = lk(&inner.sync_req);
             *r = true;
             inner.sync_req_cv.notify_all();
         }
-        if let Some(h) = self.syncer.lock().unwrap().take() {
+        if let Some(h) = lk(&self.syncer).take() {
             let _ = h.join();
         }
         while inner.compacting.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(2));
         }
-        let w = inner.writer.lock().unwrap();
+        let w = lk(&inner.writer);
         inner.sync_file(&w.file)?;
         Ok(())
     }
@@ -898,7 +975,7 @@ impl Inner {
     /// terminó bien: adelantarla tras un fallo convertiría la promesa «está en
     /// disco» en una mentira.
     fn mark_synced(&self, seq: u64) {
-        let mut g = self.synced.lock().unwrap();
+        let mut g = lk(&self.synced);
         if seq > g.seq {
             g.seq = seq;
             self.synced_cv.notify_all();
@@ -909,7 +986,7 @@ impl Inner {
     /// que es lo que evita que se queden colgados para siempre al no avanzar
     /// la marca.
     fn mark_failed(&self, e: &io::Error) {
-        let mut g = self.synced.lock().unwrap();
+        let mut g = lk(&self.synced);
         if g.failed.is_none() {
             g.failed = Some(e.to_string());
             eprintln!("bitacora: FALLO DE DURABILIDAD, no se vuelve a escribir: {e}");
@@ -919,7 +996,7 @@ impl Inner {
 
     /// Rechaza la operación si la base de datos ya no es escribible.
     fn check_writable(&self) -> io::Result<()> {
-        let g = self.synced.lock().unwrap();
+        let g = lk(&self.synced);
         match &g.failed {
             Some(m) => Err(self.no_escribible(m)),
             None => Ok(()),
@@ -931,11 +1008,11 @@ impl Inner {
     /// dato que no esté confirmado.
     fn wait_synced(&self, seq: u64) -> io::Result<()> {
         {
-            let mut r = self.sync_req.lock().unwrap();
+            let mut r = lk(&self.sync_req);
             *r = true;
             self.sync_req_cv.notify_one();
         }
-        let mut g = self.synced.lock().unwrap();
+        let mut g = lk(&self.synced);
         loop {
             if let Some(m) = &g.failed {
                 let m = m.clone();
@@ -958,7 +1035,7 @@ impl Inner {
         let f = Arc::new(open_segment(&self.opts.dir, id)?);
         // C3: crear el fichero no es durable hasta sincronizar el directorio.
         sync_dir(&self.opts.dir)?;
-        self.segments.write().unwrap().insert(id, Arc::clone(&f));
+        wr(&self.segments).insert(id, Arc::clone(&f));
         w.file = f;
         w.id = id;
         w.len = 0;
@@ -990,7 +1067,7 @@ impl Inner {
 
     fn new_out(&self) -> io::Result<OutSeg> {
         let id = {
-            let mut w = self.writer.lock().unwrap();
+            let mut w = lk(&self.writer);
             let id = w.next_id;
             w.next_id += 1;
             id
@@ -998,7 +1075,7 @@ impl Inner {
         let f = Arc::new(open_segment(&self.opts.dir, id)?);
         // C3: el nombre nuevo no es durable hasta sincronizar el directorio.
         sync_dir(&self.opts.dir)?;
-        self.segments.write().unwrap().insert(id, Arc::clone(&f));
+        wr(&self.segments).insert(id, Arc::clone(&f));
         Ok(OutSeg { id, file: f, len: 0, buf: Vec::with_capacity(4096) })
     }
 
@@ -1013,8 +1090,8 @@ impl Inner {
 
     fn compact_inner(&self) -> io::Result<CompactReport> {
         let mut old_ids: Vec<u32> = {
-            let w = self.writer.lock().unwrap();
-            let segs = self.segments.read().unwrap();
+            let w = lk(&self.writer);
+            let segs = rd(&self.segments);
             segs.keys().copied().filter(|&id| id != w.id).collect()
         };
         old_ids.sort_unstable();
@@ -1031,7 +1108,7 @@ impl Inner {
             let file = File::open(&path)?;
             let len = file.metadata()?.len();
             scanned += len;
-            let mut rd = SegmentReader::new(BufReader::with_capacity(1 << 16, file), len);
+            let mut lector = SegmentReader::new(BufReader::with_capacity(1 << 16, file), len);
             loop {
                 if self.stop.load(Ordering::Relaxed) {
                     // Cierre en marcha: abandonar sin tocar los ficheros viejos.
@@ -1041,7 +1118,7 @@ impl Inner {
                     }
                     return Ok(CompactReport::default());
                 }
-                let r = match rd.next()? {
+                let r = match lector.next()? {
                     ReadOutcome::Record(r) => r,
                     ReadOutcome::Corrupt { at, cause, .. } => {
                         // Integridad antes que rendimiento. Si un segmento se
@@ -1061,7 +1138,7 @@ impl Inner {
                     continue; // las lápidas sobran: los PUT viejos no se copian
                 }
                 let shard = self.shard(&r.key);
-                let cur = match shard.map.read().unwrap().get(&r.key[..]) {
+                let cur = match rd(&shard.map).get(&r.key[..]) {
                     Some(l) => *l,
                     None => continue,
                 };
@@ -1095,7 +1172,7 @@ impl Inner {
                 o.len += rlen;
                 copied += rlen;
                 // Solo movemos el puntero si nadie ha escrito la clave mientras tanto.
-                let mut m = shard.map.write().unwrap();
+                let mut m = wr(&shard.map);
                 if let Some(e) = m.get_mut(&r.key[..]) {
                     if *e == cur {
                         *e = newloc;
@@ -1114,7 +1191,7 @@ impl Inner {
         // Retirar los segmentos viejos: primero del mapa (los lectores que ya
         // tenían el descriptor siguen leyendo sin problema), luego del disco.
         {
-            let mut segs = self.segments.write().unwrap();
+            let mut segs = wr(&self.segments);
             for id in &old_ids {
                 segs.remove(id);
             }
@@ -1136,12 +1213,12 @@ impl Inner {
     /// Recalcula bytes vivos/muertos desde cero (O(claves)); solo tras compactar.
     fn recount(&self) {
         let total: u64 = {
-            let segs = self.segments.read().unwrap();
+            let segs = rd(&self.segments);
             segs.values().map(|f| f.metadata().map(|m| m.len()).unwrap_or(0)).sum()
         };
         let mut live = 0u64;
         for s in &self.shards {
-            let m = s.map.read().unwrap();
+            let m = rd(&s.map);
             for (k, l) in m.iter() {
                 live += rec_len(k.len(), l.vlen);
             }
@@ -1163,7 +1240,7 @@ struct OutSeg {
 fn syncer_loop(inner: Arc<Inner>) {
     loop {
         {
-            let mut req = inner.sync_req.lock().unwrap();
+            let mut req = lk(&inner.sync_req);
             if !*req && !inner.stop.load(Ordering::Acquire) {
                 let (g, _) = inner
                     .sync_req_cv
@@ -1178,10 +1255,10 @@ fn syncer_loop(inner: Arc<Inner>) {
         // a los escritores. Todo lo anterior a `last` ya está en este fichero
         // (o en segmentos previos, sincronizados al cerrarlos).
         let (file, last) = {
-            let w = inner.writer.lock().unwrap();
+            let w = lk(&inner.writer);
             (Arc::clone(&w.file), w.next_seq - 1)
         };
-        let ya = inner.synced.lock().unwrap().seq;
+        let ya = lk(&inner.synced).seq;
         if last > ya {
             match inner.sync_file(&file) {
                 Ok(()) => inner.mark_synced(last),
@@ -1194,5 +1271,58 @@ fn syncer_loop(inner: Arc<Inner>) {
         if stopping {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M2: descontar más de lo que hay no debe envolverse a 18 exabytes. Esos
+    /// contadores deciden cuándo se compacta, así que un valor absurdo no es
+    /// solo cosmético.
+    #[test]
+    fn sub_sat_no_se_envuelve() {
+        let a = AtomicU64::new(10);
+        sub_sat(&a, 3);
+        assert_eq!(a.load(Ordering::Relaxed), 7);
+        sub_sat(&a, 100);
+        assert_eq!(a.load(Ordering::Relaxed), 0, "debe quedarse en 0, no envolverse");
+        sub_sat(&a, 1);
+        assert_eq!(a.load(Ordering::Relaxed), 0);
+    }
+
+    /// A6: un panic con el candado tomado envenena el candado. Con
+    /// `.lock().unwrap()` eso hacía entrar en panic a todas las operaciones
+    /// siguientes, es decir, convertía un fallo aislado en un proceso
+    /// inservible. Los auxiliares se recuperan.
+    #[test]
+    fn los_candados_se_recuperan_del_envenenamiento() {
+        let anterior = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // el panic es a propósito
+
+        let m = Arc::new(Mutex::new(1u32));
+        let m2 = Arc::clone(&m);
+        let _ = thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("envenenando a propósito");
+        })
+        .join();
+
+        let l = Arc::new(RwLock::new(2u32));
+        let l2 = Arc::clone(&l);
+        let _ = thread::spawn(move || {
+            let _g = l2.write().unwrap();
+            panic!("envenenando a propósito");
+        })
+        .join();
+
+        std::panic::set_hook(anterior);
+
+        assert!(m.lock().is_err(), "el candado debería estar envenenado");
+        assert_eq!(*lk(&m), 1, "lk tiene que recuperarse y devolver el valor");
+        assert!(l.read().is_err(), "el RwLock debería estar envenenado");
+        assert_eq!(*rd(&l), 2, "rd tiene que recuperarse");
+        assert_eq!(*wr(&l), 2, "wr tiene que recuperarse");
     }
 }
