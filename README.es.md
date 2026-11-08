@@ -42,7 +42,7 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
-STATS                      → STATS 13  /  keys 0 / segments 1 / ... / synced_seq 3
+STATS                      → STATS 14  /  keys 0 / ... / synced_seq 3 / health ok
 COMPACT                    → OK segmentos_retirados=1 bytes_antes=132 bytes_despues=68
 PING                       → PONG
 QUIT                       → BYE
@@ -55,7 +55,7 @@ Opciones de `serve`: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
 Pruebas y benchmark:
 
 ```bash
-cargo test                                   # 33 pruebas (unitarias + integración)
+cargo test                                   # 39 pruebas (unitarias + integración)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -208,7 +208,28 @@ presenta como íntegra. Las garantías de cada operación y los diez límites
 explícitos de lo que la recuperación **no** puede hacer están en
 [docs/RECUPERACION.md](docs/RECUPERACION.md).
 
-## Pruebas (33)
+## Cuando falla el disco
+
+Un `fsync` fallido **no se reintenta**: la base queda no escribible hasta
+reiniciar, y las lecturas siguen funcionando. En Linux, un `fsync` que falla
+puede haber descartado ya las páginas sucias, así que un segundo `fsync`
+devuelve éxito sobre un dato que nunca llegó al disco; seguir aceptando
+escrituras después de eso es prometer una durabilidad que no se puede cumplir.
+PostgreSQL tomó la misma decisión en 2018.
+
+En concreto: la marca de durabilidad **no** avanza (antes sí, y eso convertía
+«está en disco» en una mentira), los escritores que esperaban el `fsync` en
+grupo se despiertan y reciben el error en vez de colgarse, `STATS` publica
+`health no-escribible (motivo)`, y `put`/`delete` fallan con un mensaje
+explícito. El estado es del proceso, no de los ficheros: al reiniciar vuelve a
+ser escribible con lo que de verdad llegó al disco.
+
+Crear y borrar segmentos sincroniza ahora también el **directorio** que los
+contiene: en POSIX el nombre de un fichero no es durable sin eso, así que un
+apagón justo después de compactar podría dejar los segmentos nuevos sin entrada
+de directorio y los viejos ya borrados.
+
+## Pruebas (39)
 
 * `crc32`: vector estándar, cálculo por trozos.
 * `wal`: ida y vuelta, cola cortada, bit cambiado.
@@ -224,6 +245,11 @@ explícitos de lo que la recuperación **no** puede hacer están en
 * Concurrencia: 8 hilos × 3.000 escrituras con lecturas cruzadas y reinicio,
   clave caliente desde 8 hilos coherente con el log, compactación mientras se
   escribe y se lee, group commit con 16 hilos (`synced_seq == last_seq` al final).
+* Durabilidad con el disco fallando (`tests/durabilidad.rs`, 6 pruebas, con
+  errores de `fsync` inyectados): la marca no avanza más allá de un `fsync`
+  fallido, el escritor recibe el error en vez de colgarse, **todos** los
+  escritores que esperaban lo reciben, un fallo al cerrar un segmento se
+  propaga, y tras reiniciar vuelve a ser escribible.
 
 ## Decisiones y límites (para defenderlo)
 

@@ -93,10 +93,12 @@ dos consecuencias malas:
   limpiarlo, o un camino que no lo consulte — convierte esto en pérdida silenciosa de datos ya
   confirmados.
 
-**Arreglo:** no llamar a `mark_synced` si el `fsync` falló; propagar el error a los escritores que
-esperaban ese rango de `seq`; y decidir y documentar la política ante error de `fsync` (lo
-habitual y defendible: marcar la base de datos como no escribible y exigir reinicio, que es lo que
-hace PostgreSQL desde 2018).
+**RESUELTO en el Gate 1.** El estado de durabilidad pasa a vivir entero bajo un único candado
+(`SyncState { seq, failed }`), lo que evita la inversión de orden que tendría un candado aparte
+frente a `wait_synced`. `mark_synced` solo se llama cuando el `fsync` terminó bien; ante fallo,
+`mark_failed` despierta a los que esperaban —si no, el arreglo ingenuo los cuelga para siempre—
+y la base queda no escribible hasta reiniciar. Seis pruebas en `tests/durabilidad.rs`, con
+inyección de fallos vía `Options::fsync_falla_tras`. Ver `docs/RECUPERACION.md`.
 
 ## C3 · No se sincroniza el directorio al crear ni al borrar segmentos
 
@@ -112,9 +114,10 @@ nunca el directorio. Secuencia de pérdida total, realista:
 3. Apagón antes de que el sistema de ficheros haga durable la entrada de directorio.
 4. Al arrancar: los viejos ya no están y los nuevos no existen para el directorio.
 
-**Arreglo:** `fsync` del directorio tras crear un segmento y tras cada tanda de borrados, y
-ordenar la compactación como crear → sincronizar fichero → sincronizar directorio → borrar viejos
-→ sincronizar directorio.
+**RESUELTO en el Gate 1.** `sync_dir` tras crear cada segmento (`open`, `roll`, `new_out`), tras
+copiar un segmento a cuarentena, y en la compactación antes y después de borrar los viejos. No es
+verificable por prueba —un `fsync` no se observa sin cortar la corriente de verdad— y así está
+anotado en `docs/RECUPERACION.md`, límite 11.
 
 ---
 

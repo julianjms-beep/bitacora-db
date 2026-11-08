@@ -76,7 +76,7 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
-STATS                      → STATS 13  /  keys 0 / segments 1 / … / synced_seq 3
+STATS                      → STATS 14  /  keys 0 / … / synced_seq 3 / health ok
 COMPACT                    → OK segmentos_retirados=1 bytes_antes=132 bytes_despues=68
 PING                       → PONG
 QUIT                       → BYE
@@ -89,7 +89,7 @@ QUIT                       → BYE
 Tests and benchmark:
 
 ```bash
-cargo test                                   # 33 tests (unit + integration)
+cargo test                                   # 39 tests (unit + integration)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -237,7 +237,27 @@ from 2,530 to 1,000 bytes. On corruption, recovery now has two modes:
 one. Guarantees per operation, and the ten explicit limits of what recovery
 cannot do, are in [docs/RECUPERACION.md](docs/RECUPERACION.md).
 
-## Tests (33)
+## When the disk fails
+
+A failed `fsync` is **not retried**. The database is marked unwritable until
+restart; reads keep working. On Linux a failed `fsync` may already have dropped
+the dirty pages, so a second `fsync` can return success for data that never
+reached the disk — continuing to accept writes after that is promising
+durability you cannot deliver. PostgreSQL made the same call in 2018.
+
+Concretely: the durability watermark does **not** advance (it used to, which
+made "it is on disk" a lie), writers waiting on a group commit are woken and get
+the error rather than hanging, `STATS` reports `health no-escribible (reason)`,
+and `put`/`delete` fail with an explicit message. The state belongs to the
+process, not the files: a restart comes up writable with whatever actually made
+it to disk.
+
+Creating and deleting segments now also `fsync` the containing **directory** —
+in POSIX a file name is not durable without it, so a power cut right after
+compaction could otherwise leave the new segments with no directory entry and
+the old ones already unlinked.
+
+## Tests (39)
 
 * `crc32`: standard vector, chunked computation.
 * `wal`: round trip, truncated tail, flipped bit.
@@ -253,6 +273,10 @@ cannot do, are in [docs/RECUPERACION.md](docs/RECUPERACION.md).
 * Concurrency: 8 threads × 3,000 writes with interleaved reads and a restart, one hot
   key from 8 threads staying consistent with the log, compaction while reading and
   writing, group commit with 16 threads (`synced_seq == last_seq` at the end).
+* Durability under disk failure (`tests/durabilidad.rs`, 6 tests, via injected
+  `fsync` errors): the watermark does not advance past a failed sync, the writer
+  gets the error instead of hanging, **all** waiting writers get it, a failure
+  while rolling a segment propagates, and a restart comes up writable again.
 
 ## Design decisions and limits
 

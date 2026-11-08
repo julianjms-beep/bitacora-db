@@ -138,6 +138,11 @@ pub struct Options {
     pub compact_dead_ratio: f64,
     /// Qué hacer ante corrupción al abrir. Ver [`RecoveryPolicy`].
     pub recovery: RecoveryPolicy,
+    /// **Inyección de fallos, solo para pruebas.** Hace que el `fsync` número
+    /// `N+1` falle, para poder comprobar qué hace el motor cuando el disco
+    /// falla de verdad. En producción se deja en `None`.
+    #[doc(hidden)]
+    pub fsync_falla_tras: Option<u64>,
 }
 
 impl Options {
@@ -153,12 +158,29 @@ impl Options {
             compact_min_dead_bytes: 16 << 20,
             compact_dead_ratio: 0.5,
             recovery: RecoveryPolicy::Estricto,
+            fsync_falla_tras: None,
         }
     }
 }
 
 /// Marca temporal de "borrado" en el índice mientras se reconstruye el estado.
 const TOMB: u32 = u32::MAX;
+
+/// Estado de durabilidad del motor.
+struct SyncState {
+    /// Último `seq` garantizado en disco.
+    seq: u64,
+    /// Si un `fsync` falló, por qué. **Es definitivo**: no se limpia.
+    ///
+    /// Un `fsync` fallido no se puede reintentar con criterio. En Linux, un
+    /// `fsync` que devuelve error puede haber descartado ya las páginas sucias,
+    /// de modo que un segundo `fsync` devuelve éxito sin que el dato haya
+    /// llegado nunca al disco. Seguir aceptando escrituras después de eso es
+    /// prometer durabilidad en falso, así que el motor se declara no
+    /// escribible y exige reiniciar: al reabrir se lee lo que de verdad hay en
+    /// disco. Es la misma decisión que tomó PostgreSQL en 2018.
+    failed: Option<String>,
+}
 
 /// Dónde está el valor de una clave. 24 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,12 +237,16 @@ struct Inner {
     /// Descriptores de lectura de todos los segmentos (incluido el activo).
     segments: RwLock<HashMap<u32, Arc<File>>>,
     writer: Mutex<Writer>,
-    /// Último `seq` que está garantizado en disco.
-    synced: Mutex<u64>,
+    /// Estado de durabilidad: hasta dónde está en disco y si el disco falló.
+    /// Las dos cosas van bajo el **mismo** candado a propósito: `wait_synced`
+    /// espera sosteniéndolo, así que un estado de fallo en otro candado daría
+    /// una inversión de orden y podría bloquear.
+    synced: Mutex<SyncState>,
     synced_cv: Condvar,
     sync_req: Mutex<bool>,
     sync_req_cv: Condvar,
-    sync_error: Mutex<Option<String>>,
+    /// Cuántos `fsync` se han hecho. Solo se cuenta con inyección de fallos.
+    syncs_hechos: AtomicU64,
     stop: AtomicBool,
     compacting: AtomicBool,
     live: AtomicU64,
@@ -247,6 +273,8 @@ pub struct Stats {
     pub synced_seq: u64,
     pub fsync: String,
     pub compacting: bool,
+    /// `ok`, o `no-escribible (motivo)` si un `fsync` falló.
+    pub health: String,
     /// Zonas ilegibles saltadas al abrir. Si no es 0, **se perdieron datos**.
     pub recovery_corrupt_records: u64,
     pub recovery_corrupt_bytes: u64,
@@ -266,6 +294,7 @@ impl Stats {
             format!("synced_seq {}", self.synced_seq),
             format!("fsync {}", self.fsync),
             format!("compacting {}", self.compacting),
+            format!("health {}", self.health),
             format!("recovery_corrupt_records {}", self.recovery_corrupt_records),
             format!("recovery_corrupt_bytes {}", self.recovery_corrupt_bytes),
             format!("recovery_truncated_tails {}", self.recovery_truncated_tails),
@@ -346,6 +375,28 @@ fn sync_fd(f: &File, full: bool) -> io::Result<()> {
         f.sync_all()
     } else {
         f.sync_data()
+    }
+}
+
+/// Sincroniza el **directorio**, no un fichero.
+///
+/// En POSIX, crear o borrar un fichero no es durable hasta que se sincroniza el
+/// directorio que lo contiene. Sin esto, un apagón justo después de compactar
+/// puede dejar los segmentos nuevos sin entrada de directorio y los viejos ya
+/// borrados: pérdida total.
+///
+/// Se usa `fsync` y nunca `F_FULLFSYNC`, porque lo que hay que hacer durable
+/// son los metadatos del directorio, y `F_FULLFSYNC` está pensado para el
+/// contenido de los ficheros.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    let f = File::open(dir)?;
+    #[cfg(target_os = "macos")]
+    {
+        sync_fd(&f, false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        f.sync_all()
     }
 }
 
@@ -479,6 +530,8 @@ impl Db {
                         fs::copy(&src, &dst)?;
                         report.quarantined.push(dst);
                     }
+                    // La copia de seguridad no sirve de nada si no es durable.
+                    sync_dir(&opts.dir)?;
                     eprintln!(
                         "bitacora: AVISO — recuperación CON PÉRDIDAS: {} zona(s) ilegible(s), {} byte(s). \
                          Copia previa de {} segmento(s) en .corrupto-{ts}",
@@ -521,6 +574,7 @@ impl Db {
             _ => {
                 let id = ids.last().map_or(1, |l| l + 1);
                 let f = Arc::new(open_segment(&opts.dir, id)?);
+                sync_dir(&opts.dir)?; // C3
                 segments.insert(id, Arc::clone(&f));
                 (id, f)
             }
@@ -539,11 +593,11 @@ impl Db {
                 next_id: active_id + 1,
                 buf: Vec::with_capacity(4096),
             }),
-            synced: Mutex::new(next_seq - 1),
+            synced: Mutex::new(SyncState { seq: next_seq - 1, failed: None }),
             synced_cv: Condvar::new(),
             sync_req: Mutex::new(false),
             sync_req_cv: Condvar::new(),
-            sync_error: Mutex::new(None),
+            syncs_hechos: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
             live: AtomicU64::new(live),
@@ -568,6 +622,7 @@ impl Db {
     pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
         validate(key, Some(value))?;
         let inner = &*self.inner;
+        inner.check_writable()?;
         let seq;
         {
             let mut w = inner.writer.lock().unwrap();
@@ -592,7 +647,7 @@ impl Db {
             w.next_seq += 1;
             w.len = start + rlen;
             if inner.opts.fsync == FsyncPolicy::Always {
-                inner.sync_file(&w.file)?;
+                inner.sync_file_or_fail(&w.file)?;
                 inner.mark_synced(seq);
             }
             let loc = Loc {
@@ -656,6 +711,7 @@ impl Db {
     pub fn delete(&self, key: &[u8]) -> io::Result<bool> {
         validate(key, None)?;
         let inner = &*self.inner;
+        inner.check_writable()?;
         let seq;
         {
             let mut w = inner.writer.lock().unwrap();
@@ -683,7 +739,7 @@ impl Db {
             w.next_seq += 1;
             w.len = start + rlen;
             if inner.opts.fsync == FsyncPolicy::Always {
-                inner.sync_file(&w.file)?;
+                inner.sync_file_or_fail(&w.file)?;
                 inner.mark_synced(seq);
             }
             shard.map.write().unwrap().remove(key);
@@ -740,9 +796,14 @@ impl Db {
             (segs.len() as u64, disk)
         };
         // Ambos bajo el candado de escritura: así `synced_seq <= last_seq` siempre.
-        let (last_seq, synced_seq) = {
+        let (last_seq, synced_seq, health) = {
             let w = inner.writer.lock().unwrap();
-            (w.next_seq - 1, *inner.synced.lock().unwrap())
+            let s = inner.synced.lock().unwrap();
+            let health = match &s.failed {
+                None => "ok".to_string(),
+                Some(m) => format!("no-escribible ({m})"),
+            };
+            (w.next_seq - 1, s.seq, health)
         };
         Stats {
             keys,
@@ -756,6 +817,7 @@ impl Db {
             synced_seq,
             fsync: inner.opts.fsync.name().to_string(),
             compacting: inner.compacting.load(Ordering::Relaxed),
+            health,
             recovery_corrupt_records: inner.recovery.corrupt_records,
             recovery_corrupt_bytes: inner.recovery.corrupt_bytes,
             recovery_truncated_tails: inner.recovery.truncated_tails.len() as u64,
@@ -804,18 +866,69 @@ impl Inner {
     }
 
     fn sync_file(&self, f: &File) -> io::Result<()> {
+        if let Some(n) = self.opts.fsync_falla_tras {
+            if self.syncs_hechos.fetch_add(1, Ordering::Relaxed) >= n {
+                return Err(io::Error::other("fallo de E/S inyectado en fsync (solo pruebas)"));
+            }
+        }
         sync_fd(f, self.opts.full_fsync)
     }
 
+    /// Como `sync_file`, pero un fallo deja la base de datos no escribible.
+    fn sync_file_or_fail(&self, f: &File) -> io::Result<()> {
+        match self.sync_file(f) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.mark_failed(&e);
+                Err(self.no_escribible(&e.to_string()))
+            }
+        }
+    }
+
+    fn no_escribible(&self, motivo: &str) -> io::Error {
+        io::Error::other(format!(
+            "base de datos NO ESCRIBIBLE: un fsync falló ({motivo}). \
+             Las escrituras se rechazan hasta reiniciar: un fsync fallido no se \
+             puede reintentar con criterio, porque el sistema puede haber \
+             descartado ya los datos sin escribirlos"
+        ))
+    }
+
+    /// Avanza la marca de durabilidad. **Solo** se llama cuando el `fsync`
+    /// terminó bien: adelantarla tras un fallo convertiría la promesa «está en
+    /// disco» en una mentira.
     fn mark_synced(&self, seq: u64) {
         let mut g = self.synced.lock().unwrap();
-        if seq > *g {
-            *g = seq;
+        if seq > g.seq {
+            g.seq = seq;
             self.synced_cv.notify_all();
         }
     }
 
-    /// Pide un fsync al hilo de sincronización y espera a que `seq` esté en disco.
+    /// Declara el fallo de durabilidad y despierta a todos los que esperaban,
+    /// que es lo que evita que se queden colgados para siempre al no avanzar
+    /// la marca.
+    fn mark_failed(&self, e: &io::Error) {
+        let mut g = self.synced.lock().unwrap();
+        if g.failed.is_none() {
+            g.failed = Some(e.to_string());
+            eprintln!("bitacora: FALLO DE DURABILIDAD, no se vuelve a escribir: {e}");
+        }
+        self.synced_cv.notify_all();
+    }
+
+    /// Rechaza la operación si la base de datos ya no es escribible.
+    fn check_writable(&self) -> io::Result<()> {
+        let g = self.synced.lock().unwrap();
+        match &g.failed {
+            Some(m) => Err(self.no_escribible(m)),
+            None => Ok(()),
+        }
+    }
+
+    /// Pide un fsync al hilo de sincronización y espera a que `seq` esté en
+    /// disco. Devuelve error si el disco falló: nunca devuelve `Ok` para un
+    /// dato que no esté confirmado.
     fn wait_synced(&self, seq: u64) -> io::Result<()> {
         {
             let mut r = self.sync_req.lock().unwrap();
@@ -823,23 +936,28 @@ impl Inner {
             self.sync_req_cv.notify_one();
         }
         let mut g = self.synced.lock().unwrap();
-        while *g < seq {
+        loop {
+            if let Some(m) = &g.failed {
+                let m = m.clone();
+                drop(g);
+                return Err(self.no_escribible(&m));
+            }
+            if g.seq >= seq {
+                return Ok(());
+            }
             g = self.synced_cv.wait(g).unwrap();
         }
-        drop(g);
-        if let Some(e) = self.sync_error.lock().unwrap().as_ref() {
-            return Err(io::Error::new(io::ErrorKind::Other, e.clone()));
-        }
-        Ok(())
     }
 
     /// Cierra el segmento activo (sincronizándolo) y abre el siguiente.
     fn roll(self: &Arc<Self>, w: &mut Writer) -> io::Result<()> {
-        self.sync_file(&w.file)?;
+        self.sync_file_or_fail(&w.file)?;
         self.mark_synced(w.next_seq - 1);
         let id = w.next_id;
         w.next_id += 1;
         let f = Arc::new(open_segment(&self.opts.dir, id)?);
+        // C3: crear el fichero no es durable hasta sincronizar el directorio.
+        sync_dir(&self.opts.dir)?;
         self.segments.write().unwrap().insert(id, Arc::clone(&f));
         w.file = f;
         w.id = id;
@@ -878,6 +996,8 @@ impl Inner {
             id
         };
         let f = Arc::new(open_segment(&self.opts.dir, id)?);
+        // C3: el nombre nuevo no es durable hasta sincronizar el directorio.
+        sync_dir(&self.opts.dir)?;
         self.segments.write().unwrap().insert(id, Arc::clone(&f));
         Ok(OutSeg { id, file: f, len: 0, buf: Vec::with_capacity(4096) })
     }
@@ -986,6 +1106,10 @@ impl Inner {
         if let Some(o) = out.take() {
             self.sync_file(&o.file)?;
         }
+        // C3: los segmentos nuevos tienen que ser durables ANTES de borrar los
+        // viejos. Si no, un apagón aquí deja los viejos borrados y los nuevos
+        // sin entrada de directorio.
+        sync_dir(&self.opts.dir)?;
 
         // Retirar los segmentos viejos: primero del mapa (los lectores que ya
         // tenían el descriptor siguen leyendo sin problema), luego del disco.
@@ -998,6 +1122,8 @@ impl Inner {
         for id in &old_ids {
             fs::remove_file(seg_path(&self.opts.dir, *id))?;
         }
+        // Y el borrado tampoco es durable sin esto.
+        sync_dir(&self.opts.dir)?;
         self.recount();
         Ok(CompactReport {
             ran: true,
@@ -1055,12 +1181,15 @@ fn syncer_loop(inner: Arc<Inner>) {
             let w = inner.writer.lock().unwrap();
             (Arc::clone(&w.file), w.next_seq - 1)
         };
-        let synced = *inner.synced.lock().unwrap();
-        if last > synced {
-            if let Err(e) = inner.sync_file(&file) {
-                *inner.sync_error.lock().unwrap() = Some(e.to_string());
+        let ya = inner.synced.lock().unwrap().seq;
+        if last > ya {
+            match inner.sync_file(&file) {
+                Ok(()) => inner.mark_synced(last),
+                // La marca NO avanza: el dato no está en disco. Pero hay que
+                // despertar a los que esperaban para que vean el fallo en vez
+                // de quedarse colgados.
+                Err(e) => inner.mark_failed(&e),
             }
-            inner.mark_synced(last);
         }
         if stopping {
             break;

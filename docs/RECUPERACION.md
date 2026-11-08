@@ -81,6 +81,29 @@ el original queda disponible para un análisis o un rescate posterior. Después:
 | `GET` | Devuelve el último valor confirmado, o nada. **No vuelve a comprobar el CRC** (ver límites) |
 | Apertura | Reconstruye el estado o falla; con `estricto`, nunca abre con menos datos de los que declara |
 | Compactación | Si encuentra datos ilegibles, **se abandona sin borrar ningún segmento** |
+| Cualquier escritura tras un `fsync` fallido | Se rechaza con un error explícito. Ver abajo |
+
+## Qué pasa si el `fsync` falla
+
+Un `fsync` fallido **no se reintenta** y deja la base de datos **no escribible
+hasta reiniciar**. Las lecturas siguen funcionando.
+
+No es pereza. En Linux, un `fsync` que devuelve error puede haber descartado ya
+las páginas sucias, de modo que un segundo `fsync` devuelve éxito sin que el
+dato haya llegado nunca al disco. Seguir aceptando escrituras después de eso es
+prometer durabilidad en falso. Es la misma decisión que tomó PostgreSQL en 2018.
+
+Qué se ve cuando pasa:
+
+* El `put` o `delete` devuelve un error que empieza por `base de datos NO
+  ESCRIBIBLE`.
+* **La marca de durabilidad no avanza.** Antes sí lo hacía, y eso convertía
+  «está en disco» en una mentira: `synced_seq` queda por debajo de `last_seq`.
+* Los escritores que estaban esperando el `fsync` en grupo **se despiertan y
+  reciben el error**; ninguno se queda colgado.
+* `STATS` publica `health no-escribible (motivo)`.
+* El estado es del proceso, no del fichero: al reiniciar, la base vuelve a ser
+  escribible y conserva lo que de verdad llegó al disco.
 
 ## Límites de recuperación, explícitos
 
@@ -116,7 +139,17 @@ implementación.
    recorra los segmentos buscando bits podridos antes de que un cliente los pida.
 10. **Probado con bits volteados a mano, en macOS/arm64.** No se ha probado con
     fallos reales de disco, ni en Linux, ni con inyección de fallos de E/S a
-    nivel de sistema de ficheros.
+    nivel de sistema de ficheros. El fallo de `fsync` sí se prueba, pero con un
+    error inyectado desde el propio motor (`Options::fsync_falla_tras`), no con
+    un disco que falle de verdad.
+11. **El `fsync` del directorio no es verificable por prueba.** Crear y borrar
+    segmentos sincroniza ahora el directorio que los contiene, porque en POSIX
+    el nombre de un fichero no es durable sin eso. Pero un `fsync` no se puede
+    observar desde una prueba: haría falta cortar la corriente de verdad, o un
+    sistema de ficheros instrumentado. Su corrección se sostiene por revisión
+    de código, y la prueba
+    `el_ciclo_de_vida_de_los_segmentos_sigue_funcionando` solo comprueba que
+    añadirlo no ha roto nada.
 
 ## Procedimiento ante corrupción
 
