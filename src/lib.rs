@@ -7,11 +7,13 @@
 //! - `protocol` y `server`: protocolo de texto por TCP, un hilo por conexión.
 
 pub mod crc32;
+pub mod error;
 pub mod protocol;
 pub mod server;
 pub mod store;
 pub mod wal;
 
+pub use error::{Error, Result};
 pub use store::{
     CompactReport, Db, FsyncPolicy, Options, RecoveryPolicy, RecoveryReport, Stats,
 };

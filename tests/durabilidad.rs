@@ -13,7 +13,7 @@
 
 mod common;
 
-use bitacora::{Db, FsyncPolicy, Options};
+use bitacora::{Db, Error, FsyncPolicy, Options};
 use common::TempDir;
 use std::path::Path;
 use std::sync::mpsc;
@@ -51,9 +51,14 @@ fn fsync_fallido_no_adelanta_la_marca_ni_se_declara_exito() {
     // El cuarto falla: el cliente se tiene que enterar.
     let e = match db.put(b"d", b"4") {
         Ok(()) => panic!("un fsync fallido no puede devolver OK"),
-        Err(e) => e.to_string(),
+        Err(e) => e,
     };
-    assert!(e.contains("NO ESCRIBIBLE"), "error poco claro: {e}");
+    assert!(
+        matches!(e, Error::NoEscribible(_)),
+        "categoría equivocada: {} ({e})",
+        e.categoria()
+    );
+    assert!(!e.reintentable(), "reintentar no arregla un disco caído");
 
     // Y la marca de durabilidad no ha avanzado hasta el registro que falló.
     let st = db.stats();

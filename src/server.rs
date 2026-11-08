@@ -93,7 +93,7 @@ pub fn handle(db: &Db, stream: TcpStream) -> io::Result<()> {
         let quit = match parse(&line) {
             Ok(cmd) => execute(db, cmd, &mut wr)?,
             Err(e) => {
-                writeln!(wr, "ERR {e}")?;
+                writeln!(wr, "ERR invalida {e}")?;
                 false
             }
         };
@@ -109,7 +109,7 @@ pub fn execute<W: Write>(db: &Db, cmd: Command<'_>, out: &mut W) -> io::Result<b
     match cmd {
         Command::Set { key, value } => match db.put(key, value) {
             Ok(()) => out.write_all(b"OK\n")?,
-            Err(e) => writeln!(out, "ERR {e}")?,
+            Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
         },
         Command::Get(k) => match db.get(k) {
             Ok(Some(v)) => {
@@ -118,12 +118,12 @@ pub fn execute<W: Write>(db: &Db, cmd: Command<'_>, out: &mut W) -> io::Result<b
                 out.write_all(b"\n")?;
             }
             Ok(None) => out.write_all(b"NIL\n")?,
-            Err(e) => writeln!(out, "ERR {e}")?,
+            Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
         },
         Command::Del(k) => match db.delete(k) {
             Ok(true) => out.write_all(b"OK\n")?,
             Ok(false) => out.write_all(b"NIL\n")?,
-            Err(e) => writeln!(out, "ERR {e}")?,
+            Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
         },
         Command::Exists(k) => writeln!(out, "INT {}", db.exists(k) as u8)?,
         Command::Keys(prefix) => {
@@ -148,7 +148,7 @@ pub fn execute<W: Write>(db: &Db, cmd: Command<'_>, out: &mut W) -> io::Result<b
                 r.segments_removed, r.bytes_before, r.bytes_after
             )?,
             Ok(_) => out.write_all(b"OK ya_habia_una_compactacion_en_marcha\n")?,
-            Err(e) => writeln!(out, "ERR {e}")?,
+            Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
         },
         Command::Ping => out.write_all(b"PONG\n")?,
         Command::Quit => {

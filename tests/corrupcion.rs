@@ -18,7 +18,7 @@
 
 mod common;
 
-use bitacora::{Db, FsyncPolicy, Options, RecoveryPolicy};
+use bitacora::{Db, Error, FsyncPolicy, Options, RecoveryPolicy};
 use common::{segments, TempDir};
 use std::path::{Path, PathBuf};
 
@@ -89,6 +89,12 @@ fn fallo_original_estricto_se_niega_y_no_toca_el_fichero() {
         Ok(_) => panic!("con corrupción, el modo estricto debe negarse a abrir"),
         Err(e) => e,
     };
+    assert!(
+        matches!(e, Error::Corrupcion(_)),
+        "categoría equivocada: {} ({e})",
+        e.categoria()
+    );
+    assert!(!e.reintentable(), "la corrupción necesita intervención humana");
     let msg = e.to_string();
     assert!(msg.contains("recuperación abortada"), "mensaje inesperado: {msg}");
     assert!(msg.contains("NO se ha modificado ningún fichero"), "mensaje inesperado: {msg}");

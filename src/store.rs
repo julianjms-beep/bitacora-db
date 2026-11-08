@@ -17,6 +17,7 @@
 //! - **Compactación**: reescribe solo los registros vivos de los segmentos
 //!   cerrados en segmentos nuevos, con lecturas y escrituras en marcha.
 
+use crate::error::{Error, Result};
 use crate::wal::{self, Kind, ReadOutcome, SegmentReader, HEADER, MAX_KEY, MAX_VALUE};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -354,22 +355,16 @@ fn open_segment(dir: &Path, id: u32) -> io::Result<File> {
         .open(seg_path(dir, id))
 }
 
-fn validate(key: &[u8], value: Option<&[u8]>) -> io::Result<()> {
+fn validate(key: &[u8], value: Option<&[u8]>) -> Result<()> {
     if key.is_empty() || key.len() > MAX_KEY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "clave vacía o de más de 64 KiB",
-        ));
+        return Err(Error::Invalida("clave vacía o de más de 64 KiB"));
     }
     if let Some(v) = value {
         // M8: el lector acepta `vlen <= MAX_VALUE`, así que el escritor tiene
         // que rechazar exactamente lo mismo. Antes rechazaba `>=`, de modo que
         // un valor de 1 GiB justos era ilegal al escribir y legal al leer.
         if v.len() > MAX_VALUE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "valor de más de 1 GiB",
-            ));
+            return Err(Error::Invalida("valor de más de 1 GiB"));
         }
     }
     Ok(())
@@ -414,7 +409,7 @@ fn sync_fd(f: &File, full: bool) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn sync_fd(f: &File, full: bool) -> io::Result<()> {
+fn sync_fd(f: &File, full: bool) -> Result<()> {
     if full {
         f.sync_all()
     } else {
@@ -445,14 +440,14 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 }
 
 impl Db {
-    pub fn open_default(dir: impl Into<PathBuf>) -> io::Result<Db> {
+    pub fn open_default(dir: impl Into<PathBuf>) -> Result<Db> {
         Db::open(Options::new(dir))
     }
 
     /// Abre (o crea) la base de datos y reconstruye el índice leyendo todos
     /// los segmentos. Si el último registro de un fichero está a medias, lo
     /// recorta: así se recupera de un apagón.
-    pub fn open(opts: Options) -> io::Result<Db> {
+    pub fn open(opts: Options) -> Result<Db> {
         fs::create_dir_all(&opts.dir)?;
         let mut ids: Vec<u32> = Vec::new();
         for entry in fs::read_dir(&opts.dir)? {
@@ -560,7 +555,7 @@ impl Db {
                     msg.push_str(
                         "  Para abrir saltándose lo ilegible (copiando antes cada segmento afectado): --recuperacion reparar",
                     );
-                    return Err(io::Error::other(msg));
+                    return Err(Error::Corrupcion(msg));
                 }
                 RecoveryPolicy::Reparar => {
                     let ts = SystemTime::now()
@@ -663,7 +658,7 @@ impl Db {
         Ok(Db { inner, syncer: Mutex::new(syncer), closed: AtomicBool::new(false) })
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         validate(key, Some(value))?;
         let inner = &*self.inner;
         inner.check_writable()?;
@@ -695,7 +690,7 @@ impl Db {
                              {e2} (el fallo original fue: {e})"
                         )));
                     }
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
             w.next_seq += 1;
@@ -724,7 +719,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let inner = &*self.inner;
         let shard = inner.shard(key);
         // La compactación puede retirar un segmento entre que se consulta el
@@ -751,8 +746,8 @@ impl Db {
             }
             vueltas += 1;
             if Instant::now() >= limite {
-                return Err(io::Error::other(format!(
-                    "fallo interno: la clave está en el índice pero su segmento \
+                return Err(Error::Interno(format!(
+                    "la clave está en el índice pero su segmento \
                      ({}) desapareció y no reapareció en {:?} ({vueltas} intentos). \
                      Esto no significa que la clave no exista",
                     loc.file_id, inner.opts.read_retry_timeout
@@ -778,7 +773,7 @@ impl Db {
     }
 
     /// Devuelve `true` si la clave existía. Escribe una lápida en el log.
-    pub fn delete(&self, key: &[u8]) -> io::Result<bool> {
+    pub fn delete(&self, key: &[u8]) -> Result<bool> {
         validate(key, None)?;
         let inner = &*self.inner;
         inner.check_writable()?;
@@ -810,7 +805,7 @@ impl Db {
                              {e2} (el fallo original fue: {e})"
                         )));
                     }
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
             w.next_seq += 1;
@@ -903,11 +898,11 @@ impl Db {
 
     /// Reescribe los registros vivos de todos los segmentos cerrados y borra
     /// los viejos. Puede ejecutarse con lecturas y escrituras en marcha.
-    pub fn compact(&self) -> io::Result<CompactReport> {
+    pub fn compact(&self) -> Result<CompactReport> {
         self.inner.compact()
     }
 
-    pub fn close(&self) -> io::Result<()> {
+    pub fn close(&self) -> Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -952,7 +947,7 @@ impl Inner {
     }
 
     /// Como `sync_file`, pero un fallo deja la base de datos no escribible.
-    fn sync_file_or_fail(&self, f: &File) -> io::Result<()> {
+    fn sync_file_or_fail(&self, f: &File) -> Result<()> {
         match self.sync_file(f) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -962,12 +957,11 @@ impl Inner {
         }
     }
 
-    fn no_escribible(&self, motivo: &str) -> io::Error {
-        io::Error::other(format!(
-            "base de datos NO ESCRIBIBLE: un fsync falló ({motivo}). \
-             Las escrituras se rechazan hasta reiniciar: un fsync fallido no se \
-             puede reintentar con criterio, porque el sistema puede haber \
-             descartado ya los datos sin escribirlos"
+    fn no_escribible(&self, motivo: &str) -> Error {
+        Error::NoEscribible(format!(
+            "un fsync falló ({motivo}). Las escrituras se rechazan hasta \
+             reiniciar: un fsync fallido no se puede reintentar con criterio, \
+             porque el sistema puede haber descartado ya los datos sin escribirlos"
         ))
     }
 
@@ -995,7 +989,7 @@ impl Inner {
     }
 
     /// Rechaza la operación si la base de datos ya no es escribible.
-    fn check_writable(&self) -> io::Result<()> {
+    fn check_writable(&self) -> Result<()> {
         let g = lk(&self.synced);
         match &g.failed {
             Some(m) => Err(self.no_escribible(m)),
@@ -1006,7 +1000,7 @@ impl Inner {
     /// Pide un fsync al hilo de sincronización y espera a que `seq` esté en
     /// disco. Devuelve error si el disco falló: nunca devuelve `Ok` para un
     /// dato que no esté confirmado.
-    fn wait_synced(&self, seq: u64) -> io::Result<()> {
+    fn wait_synced(&self, seq: u64) -> Result<()> {
         {
             let mut r = lk(&self.sync_req);
             *r = true;
@@ -1027,7 +1021,7 @@ impl Inner {
     }
 
     /// Cierra el segmento activo (sincronizándolo) y abre el siguiente.
-    fn roll(self: &Arc<Self>, w: &mut Writer) -> io::Result<()> {
+    fn roll(self: &Arc<Self>, w: &mut Writer) -> Result<()> {
         self.sync_file_or_fail(&w.file)?;
         self.mark_synced(w.next_seq - 1);
         let id = w.next_id;
@@ -1065,7 +1059,7 @@ impl Inner {
             });
     }
 
-    fn new_out(&self) -> io::Result<OutSeg> {
+    fn new_out(&self) -> Result<OutSeg> {
         let id = {
             let mut w = lk(&self.writer);
             let id = w.next_id;
@@ -1079,7 +1073,7 @@ impl Inner {
         Ok(OutSeg { id, file: f, len: 0, buf: Vec::with_capacity(4096) })
     }
 
-    fn compact(&self) -> io::Result<CompactReport> {
+    fn compact(&self) -> Result<CompactReport> {
         if self.compacting.swap(true, Ordering::AcqRel) {
             return Ok(CompactReport::default());
         }
@@ -1088,7 +1082,7 @@ impl Inner {
         r
     }
 
-    fn compact_inner(&self) -> io::Result<CompactReport> {
+    fn compact_inner(&self) -> Result<CompactReport> {
         let mut old_ids: Vec<u32> = {
             let w = lk(&self.writer);
             let segs = rd(&self.segments);
@@ -1125,7 +1119,7 @@ impl Inner {
                         // ha corrompido con el proceso en marcha, se abandona
                         // la compactación: nunca se borra un segmento del que
                         // no se ha podido copiar todo lo vivo.
-                        return Err(io::Error::other(format!(
+                        return Err(Error::Corrupcion(format!(
                             "compactación abandonada: {} tiene datos ilegibles en el byte {at} ({}). \
                              No se ha borrado ningún segmento",
                             path.display(),

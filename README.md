@@ -89,7 +89,7 @@ QUIT                       → BYE
 Tests and benchmark:
 
 ```bash
-cargo test                                   # 39 tests (unit + integration)
+cargo test                                   # 45 tests (unit + integration)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -257,7 +257,20 @@ in POSIX a file name is not durable without it, so a power cut right after
 compaction could otherwise leave the new segments with no directory entry and
 the old ones already unlinked.
 
-## Tests (39)
+## Typed errors
+
+Every operation returns `Result<T, bitacora::Error>`, with five variants:
+`Invalida`, `NoEscribible`, `Corrupcion`, `Interno` and `Io`. Each one answers
+the only question a caller really has — **is retrying worth anything?** — via
+`Error::reintentable()`, and `Error::categoria()` gives a stable word for logs
+and the wire, so a client never has to parse prose. Error lines on the socket
+are now `ERR <category> <text>`.
+
+This replaced `io::Error` everywhere, which could not distinguish "your key is
+invalid" from "the disk just failed" — the two cases with opposite correct
+responses. See [docs/CAMBIOS.md](docs/CAMBIOS.md) for the incompatible changes.
+
+## Tests (45)
 
 * `crc32`: standard vector, chunked computation.
 * `wal`: round trip, truncated tail, flipped bit.

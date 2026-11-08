@@ -55,7 +55,7 @@ Opciones de `serve`: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
 Pruebas y benchmark:
 
 ```bash
-cargo test                                   # 39 pruebas (unitarias + integración)
+cargo test                                   # 45 pruebas (unitarias + integración)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -229,7 +229,22 @@ contiene: en POSIX el nombre de un fichero no es durable sin eso, así que un
 apagón justo después de compactar podría dejar los segmentos nuevos sin entrada
 de directorio y los viejos ya borrados.
 
-## Pruebas (39)
+## Errores tipados
+
+Cada operación devuelve `Result<T, bitacora::Error>`, con cinco variantes:
+`Invalida`, `NoEscribible`, `Corrupcion`, `Interno` e `Io`. Cada una responde a
+lo único que de verdad necesita saber quien llama —**¿sirve de algo
+reintentar?**— con `Error::reintentable()`, y `Error::categoria()` da una
+palabra estable para registros y para el protocolo, así que un cliente nunca
+tiene que analizar prosa. Las líneas de error por el socket son ahora
+`ERR <categoría> <texto>`.
+
+Esto sustituye al `io::Error` de antes, que no distinguía «tu clave es
+inválida» de «el disco acaba de fallar», que son justo los dos casos cuya
+respuesta correcta es opuesta. Los cambios incompatibles están en
+[docs/CAMBIOS.md](docs/CAMBIOS.md).
+
+## Pruebas (45)
 
 * `crc32`: vector estándar, cálculo por trozos.
 * `wal`: ida y vuelta, cola cortada, bit cambiado.
