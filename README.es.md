@@ -42,20 +42,41 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
-STATS                      → STATS 14  /  keys 0 / ... / synced_seq 3 / health ok
+STATS                      → STATS 29  /  keys 0 / ... / health ok / estado ok
+HEALTH                     → HEALTH ok 0        (o aviso / critico, con motivos)
+METRICS                    → METRICS 100        (formato de Prometheus)
+BACKUP noche               → OK /copias/noche segmentos=3 bytes=2148 last_seq=91
 COMPACT                    → OK segmentos_retirados=1 bytes_antes=132 bytes_despues=68
 PING                       → PONG
 QUIT                       → BYE
 ```
 
 Opciones de `serve`: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
-`--fullfsync`, `--segment-mb` (tamaño de cada fichero de log), `--max-conns`,
-`--recuperacion estricto|reparar`.
+`--fullfsync`, `--segment-mb` (tamaño de cada fichero de log), `--group-ms`,
+`--max-conns`, `--recuperacion estricto|reparar`, `--clave`, `--backup-dir`,
+`--log texto|json`, `--log-nivel`, `--log-fichero`.
+
+Operarlo: la salud como código de salida, las métricas, y copias en caliente y
+en frío.
+
+```bash
+bitacora health --port 7379     # imprime ok|aviso|critico; salida 0, 1 o 2
+bitacora metrics --port 7379    # texto de Prometheus, para node_exporter
+bitacora backup --dir data --a /copias/manual   # copia en frío, con la base parada
+bitacora restore --de /copias/noche --a data    # se niega si el destino tiene datos
+bitacora verificar --dir /copias/noche          # lee todo el log; salida 0 si está íntegro
+```
+
+**Un solo proceso por directorio.** Al abrir se toma un `flock` exclusivo sobre
+`<dir>/LOCK`, así que un segundo `bitacora serve` sobre la misma carpeta falla
+en vez de entremezclar registros en el mismo fichero en silencio. La guía
+completa de operación, con el catálogo de eventos y de métricas y los
+procedimientos de copia, está en [docs/OPERACION.md](docs/OPERACION.md).
 
 Pruebas y benchmark:
 
 ```bash
-cargo test                                   # 59 pruebas (unitarias + integración)
+cargo test                                   # 92 pruebas (unitarias + integración)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -194,8 +215,11 @@ src/wal.rs       formato de registro, codificador, lector con detección de cola
 src/store.rs     el motor: índice por shards, segmentos, group commit, compactación
 src/protocol.rs  parser del protocolo de texto
 src/server.rs    TCP, un hilo por conexión
-src/main.rs      serve / cli / bench
-tests/           recuperación (kill -9, cola rota, bit corrupto) y concurrencia
+src/log.rs       eventos estructurados (texto o JSON por línea), sin dependencias
+src/metricas.rs  formato de exposición de Prometheus, escrito a mano
+src/main.rs      serve / cli / health / metrics / backup / restore / verificar / bench
+tests/           recuperación (kill -9, cola rota, bit corrupto), concurrencia, operación
+docs/            auditoría, recuperación, cambios, rendimiento, operación
 ```
 
 ## Corrupción y cola incompleta no son lo mismo
@@ -296,7 +320,7 @@ reproducible, y la CI les pasa `BITACORA_SEMILLA=<número de ejecución>`, así 
 cada vuelta explora una franja distinta del espacio en vez de repetir los mismos
 965 casos. Un fallo imprime su semilla y su iteración, y se reproduce exacto.
 
-## Pruebas (59)
+## Pruebas (92)
 
 * `crc32`: vector estándar, cálculo por trozos.
 * `wal`: ida y vuelta, cola cortada, bit cambiado.
@@ -319,17 +343,38 @@ cada vuelta explora una franja distinta del espacio en vez de repetir los mismos
   motor coincide con un modelo `HashMap` a lo largo de una secuencia aleatoria
   de operaciones, antes y después de reiniciar. Se han barrido 48.000 casos con
   cinco semillas a mano, además de lo que hace la CI.
-* Endurecimiento del servidor (`tests/servidor.rs`, 8 pruebas): operar sin
+* Endurecimiento del servidor (`tests/servidor.rs`, 13 pruebas): operar sin
   `AUTH`, clave equivocada, negarse a escuchar fuera de localhost sin clave, el
   tope de `KEYS` y su orden, valores con saltos de línea en los dos sentidos,
   el tope de tamaño de respuesta, el límite de conexiones y que las plazas se
-  liberan, el cierre de una conexión muda por tiempo, y que `serve` vuelve
-  cuando se le pide.
+  liberan, el cierre de una conexión muda por tiempo, que `serve` vuelve cuando
+  se le pide, que `HEALTH` y `METRICS` anuncian sus líneas sin desajustar el
+  entramado y exigen `AUTH`, y que `BACKUP` rechaza `../x`, `/tmp/x`, `a/b` y
+  `.oculta`: el cliente elige un nombre, nunca una ruta.
 * Durabilidad con el disco fallando (`tests/durabilidad.rs`, 6 pruebas, con
   errores de `fsync` inyectados): la marca no avanza más allá de un `fsync`
   fallido, el escritor recibe el error en vez de colgarse, **todos** los
   escritores que esperaban lo reciben, un fallo al cerrar un segmento se
   propaga, y tras reiniciar vuelve a ser escribible.
+* Operación (`tests/operacion.rs`, 12 pruebas): un segundo escritor sobre el
+  mismo directorio no puede abrir, y el bloqueo queda libre en cuanto `close()`
+  devuelve; una copia en caliente tomada con cuatro hilos escribiendo contiene
+  **todo lo confirmado antes del corte** y abre en modo estricto; una copia
+  tomada mientras compacta no pierde ningún segmento; una configuración que no
+  hace lo que dice se rechaza al abrir; `HEALTH` dice `critico` tras un `fsync`
+  fallido; y las métricas cumplen el formato de exposición (un `HELP`/`TYPE`
+  por familia, muestras agrupadas, contadores en `_total`) con valores que
+  cuadran con las operaciones hechas.
+* Registro estructurado (`tests/registro.rs`, 1 prueba, en su propio proceso
+  porque el registro se configura una sola vez): cada línea emitida pasa por un
+  validador estricto de JSON, incluido el caso de un directorio de datos cuyo
+  nombre lleva una comilla y una barra invertida, y se exige que una clave y un
+  valor conocidos **no aparezcan nunca en el log**.
+* Órdenes de operación (`tests/cli.rs`, 5 pruebas, contra el binario de
+  verdad): los **códigos de salida**, que es lo que de verdad lee un
+  `healthcheck` — `verificar` devuelve 1 y `INTEGRO: no` con un bit volteado;
+  copia → restauración → verificación cierran el círculo; restaurar encima de
+  datos se niega; y `health` devuelve 2, no 1, cuando no llega ni a preguntar.
 
 ## Decisiones y límites (para defenderlo)
 

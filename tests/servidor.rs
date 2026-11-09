@@ -368,3 +368,180 @@ fn el_servidor_para_cuando_se_le_pide() {
     // Y el motor se puede cerrar limpiamente después.
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Gate 6 · observabilidad y copias por el protocolo
+// ---------------------------------------------------------------------------
+
+/// `HEALTH` y `METRICS` anuncian cuántas líneas traen, igual que `STATS`, para
+/// que un cliente sepa cuándo parar de leer sin cerrar la conexión.
+#[test]
+fn health_y_metrics_anuncian_sus_lineas() {
+    let tmp = TempDir::new("srv-salud");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    db.put(b"a", b"1").unwrap();
+    let srv = Servidor::nuevo(Arc::clone(&db), ServerConfig::new("127.0.0.1", puerto(9)));
+
+    let r = srv.pide("HEALTH\n", 1);
+    assert_eq!(r[0], "HEALTH ok 0", "una base sana no tiene motivos");
+
+    // La cabecera dice n; leer n+1 líneas tiene que traer exactamente n+1
+    // porque la siguiente respuesta ya es de otra orden.
+    let r = srv.pide("METRICS\nPING\n", 1);
+    let n: usize = r[0]
+        .split_whitespace()
+        .nth(1)
+        .expect("METRICS <n>")
+        .parse()
+        .expect("n numérico");
+    assert!(n > 20, "solo {n} líneas de métricas");
+    let r = srv.pide("METRICS\nPING\n", n + 2);
+    assert_eq!(r.len(), n + 2);
+    assert!(r[1].starts_with("# HELP "), "{}", r[1]);
+    assert_eq!(r[n + 1], "PONG", "el entramado se ha desajustado");
+    // Y las métricas del servidor están además de las del motor.
+    let todo = r.join("\n");
+    assert!(todo.contains("bitacora_keys 1"), "{todo}");
+    assert!(todo.contains("bitacora_connections "), "{todo}");
+    assert!(
+        todo.contains("bitacora_connections_accepted_total "),
+        "{todo}"
+    );
+    db.close().unwrap();
+}
+
+/// El estado interno y los contadores de un servidor con clave no son
+/// información pública: `HEALTH` y `METRICS` también exigen `AUTH`.
+#[test]
+fn health_y_metrics_exigen_auth() {
+    let tmp = TempDir::new("srv-salud-auth");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    let mut cfg = ServerConfig::new("127.0.0.1", puerto(10));
+    cfg.clave = Some("secreta".into());
+    let srv = Servidor::nuevo(Arc::clone(&db), cfg);
+
+    for orden in ["HEALTH\n", "METRICS\n", "BACKUP\n"] {
+        let r = srv.pide(orden, 1);
+        assert!(
+            r[0].starts_with("ERR invalida hace falta AUTH"),
+            "{orden} sin AUTH devolvió: {}",
+            r[0]
+        );
+    }
+    let r = srv.pide("AUTH secreta\nHEALTH\n", 2);
+    assert_eq!(r[1], "HEALTH ok 0");
+    db.close().unwrap();
+}
+
+/// La copia por el protocolo escribe **dentro** del directorio configurado y
+/// solo ahí: el cliente elige un nombre, no una ruta.
+#[test]
+fn backup_por_el_protocolo_no_deja_elegir_la_ruta() {
+    let tmp = TempDir::new("srv-copia");
+    let copias = TempDir::new("srv-copia-dst");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    for i in 0..30u32 {
+        db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+    }
+    let mut cfg = ServerConfig::new("127.0.0.1", puerto(11));
+    cfg.backup_dir = Some(copias.path().to_path_buf());
+    let srv = Servidor::nuevo(Arc::clone(&db), cfg);
+
+    // Nada que se parezca a una ruta se acepta.
+    for malo in [
+        "BACKUP ../fuera\n",
+        "BACKUP /tmp/absoluta\n",
+        "BACKUP .oculta\n",
+        "BACKUP ..\n",
+        "BACKUP con/barra\n",
+        "BACKUP con espacio\n",
+    ] {
+        let r = srv.pide(malo, 1);
+        assert!(
+            r[0].starts_with("ERR invalida"),
+            "{malo:?} debería rechazarse, devolvió: {}",
+            r[0]
+        );
+    }
+    // Y nada se ha creado fuera del directorio de copias.
+    assert!(!Path::new("/tmp/absoluta").exists());
+
+    let r = srv.pide("BACKUP noche\n", 1);
+    assert!(r[0].starts_with("OK "), "{}", r[0]);
+    assert!(r[0].contains("segmentos="), "{}", r[0]);
+    let hecha = copias.path().join("noche");
+    assert!(hecha.is_dir(), "la copia tiene que estar en {hecha:?}");
+    assert!(!common::segments(&hecha).is_empty());
+
+    // Repetir el mismo nombre no machaca la copia anterior.
+    let r = srv.pide("BACKUP noche\n", 1);
+    assert!(r[0].starts_with("ERR invalida"), "{}", r[0]);
+
+    db.close().unwrap();
+    drop(db);
+
+    // La copia se abre en estricto y tiene las 30 claves.
+    let mut o = opts(&hecha);
+    o.recovery = bitacora::RecoveryPolicy::Estricto;
+    let copia = Db::open(o).expect("la copia abre sin corrupción");
+    assert_eq!(copia.len(), 30);
+    copia.close().unwrap();
+}
+
+/// Sin `--backup-dir`, la orden no existe a efectos prácticos: no se puede
+/// dejar que un cliente elija dónde escribe el servidor.
+#[test]
+fn sin_directorio_de_copias_backup_se_niega() {
+    let tmp = TempDir::new("srv-copia-no");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    let srv = Servidor::nuevo(Arc::clone(&db), ServerConfig::new("127.0.0.1", puerto(12)));
+    let r = srv.pide("BACKUP\n", 1);
+    assert!(r[0].contains("no tiene directorio de copias"), "{}", r[0]);
+    db.close().unwrap();
+}
+
+/// Una configuración de servidor que no hace lo que dice no llega a abrir el
+/// puerto.
+#[test]
+fn una_configuracion_absurda_no_llega_a_escuchar() {
+    let tmp = TempDir::new("srv-config");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+
+    /// Nombre del campo y cómo estropearlo.
+    type Caso = (&'static str, Box<dyn Fn(&mut ServerConfig)>);
+    let casos: Vec<Caso> = vec![
+        (
+            "max_conns",
+            Box::new(|c: &mut ServerConfig| c.max_conns = 0),
+        ),
+        (
+            "keys_limit",
+            Box::new(|c: &mut ServerConfig| c.keys_limit = 0),
+        ),
+        (
+            "max_value_bytes",
+            Box::new(|c: &mut ServerConfig| c.max_value_bytes = 0),
+        ),
+        (
+            "read_timeout",
+            Box::new(|c: &mut ServerConfig| c.read_timeout = Some(Duration::ZERO)),
+        ),
+        (
+            "clave",
+            Box::new(|c: &mut ServerConfig| c.clave = Some(String::new())),
+        ),
+    ];
+    for (campo, estropea) in casos {
+        let mut cfg = ServerConfig::new("127.0.0.1", puerto(13));
+        estropea(&mut cfg);
+        let r = serve(Arc::clone(&db), cfg);
+        match r {
+            Ok(()) => panic!("{campo}: no debería haber escuchado"),
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{campo}: {e}");
+                assert!(e.to_string().contains(campo), "{campo}: {e}");
+            }
+        }
+    }
+    db.close().unwrap();
+}

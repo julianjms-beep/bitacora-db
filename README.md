@@ -76,20 +76,40 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
-STATS                      → STATS 14  /  keys 0 / … / synced_seq 3 / health ok
+STATS                      → STATS 29  /  keys 0 / … / health ok / estado ok
+HEALTH                     → HEALTH ok 0        (or aviso / critico, plus reasons)
+METRICS                    → METRICS 100        (Prometheus exposition format)
+BACKUP noche               → OK /backups/noche segmentos=3 bytes=2148 last_seq=91
 COMPACT                    → OK segmentos_retirados=1 bytes_antes=132 bytes_despues=68
 PING                       → PONG
 QUIT                       → BYE
 ```
 
 `serve` options: `--dir`, `--host`, `--port`, `--fsync group|always|never`,
-`--fullfsync`, `--segment-mb` (size of each log file), `--max-conns`,
-`--recuperacion estricto|reparar`.
+`--fullfsync`, `--segment-mb` (size of each log file), `--group-ms`,
+`--max-conns`, `--recuperacion estricto|reparar`, `--clave`, `--backup-dir`,
+`--log texto|json`, `--log-nivel`, `--log-fichero`.
+
+Operating it — health as an exit code, metrics, hot and cold backups:
+
+```bash
+bitacora health --port 7379     # prints ok|aviso|critico; exit 0, 1 or 2
+bitacora metrics --port 7379    # Prometheus text, for a node_exporter file
+bitacora backup --dir data --a /backups/manual   # cold copy, server stopped
+bitacora restore --de /backups/noche --a data    # refuses a non-empty target
+bitacora verificar --dir /backups/noche          # reads the whole log, exit 0 if intact
+```
+
+**One process per directory.** Opening takes an exclusive `flock` on
+`<dir>/LOCK`, so a second `bitacora serve` on the same folder fails instead of
+silently interleaving records into the same file. The full operations guide,
+with the event and metric catalogues and the backup procedures, is in
+[docs/OPERACION.md](docs/OPERACION.md).
 
 Tests and benchmark:
 
 ```bash
-cargo test                                   # 59 tests (unit + integration)
+cargo test                                   # 92 tests (unit + integration)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -221,8 +241,11 @@ src/wal.rs       record format, encoder, reader with torn-tail detection
 src/store.rs     the engine: sharded index, segments, group commit, compaction
 src/protocol.rs  text protocol parser
 src/server.rs    TCP, one thread per connection
-src/main.rs      serve / cli / bench
-tests/           recovery (kill -9, torn tail, flipped bit) and concurrency
+src/log.rs       structured events (text or JSON per line), zero dependencies
+src/metricas.rs  Prometheus exposition format, written by hand
+src/main.rs      serve / cli / health / metrics / backup / restore / verificar / bench
+tests/           recovery (kill -9, torn tail, flipped bit), concurrency, operations
+docs/            audit, recovery, changes, performance, operations
 ```
 
 ## Corruption is not the same as a torn tail
@@ -317,7 +340,7 @@ passes `BITACORA_SEMILLA=<run number>` so every run explores a different slice
 of the random space instead of re-checking the same 965 cases. A failure prints
 its seed and iteration, so it replays exactly.
 
-## Tests (59)
+## Tests (92)
 
 * `crc32`: standard vector, chunked computation.
 * `wal`: round trip, truncated tail, flipped bit.
@@ -339,15 +362,36 @@ its seed and iteration, so it replays exactly.
   recovery never *fabricates* data, only loses it; and the engine matches a
   `HashMap` model across a random operation sequence, before and after restart.
   48,000 cases across five seeds have been run by hand on top of CI.
-* Server hardening (`tests/servidor.rs`, 8 tests): operating before `AUTH`,
+* Server hardening (`tests/servidor.rs`, 13 tests): operating before `AUTH`,
   a wrong key, refusing to bind off-localhost without one, the `KEYS` cap and
   its ordering, values with newlines in both directions, the response size cap,
   the connection limit and that slots are released, a mute connection being
-  timed out, and `serve` returning on request.
+  timed out, `serve` returning on request, `HEALTH`/`METRICS` announcing their
+  line counts without desynchronising the framing, both requiring `AUTH`, and
+  `BACKUP` rejecting `../x`, `/tmp/x`, `a/b` and `.hidden` — the client picks a
+  name, never a path.
 * Durability under disk failure (`tests/durabilidad.rs`, 6 tests, via injected
   `fsync` errors): the watermark does not advance past a failed sync, the writer
   gets the error instead of hanging, **all** waiting writers get it, a failure
   while rolling a segment propagates, and a restart comes up writable again.
+* Operations (`tests/operacion.rs`, 12 tests): a second writer on the same
+  directory cannot open and the lock is released the moment `close()` returns;
+  a hot backup taken while four threads write contains **everything committed
+  before the cut** and opens in strict mode; a backup taken while compaction
+  runs loses no segment; configuration that does not do what it says is
+  rejected at open; `HEALTH` reports `critico` after a failed `fsync`; and the
+  metrics obey the exposition format (one `HELP`/`TYPE` per family, samples
+  grouped, counters named `_total`) with values that match the operations done.
+* Structured logging (`tests/registro.rs`, 1 test, its own process because the
+  logger is configured once): every emitted line is parsed by a strict JSON
+  validator, including a data directory whose name contains a quote and a
+  backslash, and the test asserts that a known key and value **never appear in
+  the log**.
+* Operator commands (`tests/cli.rs`, 5 tests, against the real binary): the
+  **exit codes**, which is what a container healthcheck actually reads —
+  `verificar` returns 1 and `INTEGRO: no` on a flipped bit; backup → restore →
+  verify round-trips; restoring over existing data refuses; `health` returns 2
+  (not 1) when it cannot even reach the server.
 
 ## Design decisions and limits
 

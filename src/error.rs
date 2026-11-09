@@ -32,6 +32,11 @@ pub enum Error {
     /// fichero**. El texto dice qué se encontró y dónde.
     Corrupcion(String),
 
+    /// La configuración con la que se intenta abrir el motor (o arrancar el
+    /// servidor) no es utilizable. Se detecta **antes** de tocar nada, para que
+    /// un valor absurdo no se convierta en un fallo raro horas después.
+    Configuracion(String),
+
     /// Una invariante del motor no se cumple. No es culpa de la petición, y
     /// merece un informe de fallo.
     Interno(String),
@@ -48,6 +53,7 @@ impl Error {
             Error::Invalida(_) => "invalida",
             Error::NoEscribible(_) => "no-escribible",
             Error::Corrupcion(_) => "corrupcion",
+            Error::Configuracion(_) => "configuracion",
             Error::Interno(_) => "interno",
             Error::Io(_) => "io",
         }
@@ -56,11 +62,15 @@ impl Error {
     /// ¿Tiene sentido que el cliente reintente la misma operación?
     ///
     /// `Invalida` no: dará lo mismo. `NoEscribible` no: hace falta reiniciar el
-    /// servidor. `Corrupcion` no: hace falta intervención humana. `Interno` e
+    /// servidor. `Corrupcion` no: hace falta intervención humana.
+    /// `Configuracion` tampoco: hay que cambiar la configuración. `Interno` e
     /// `Io` sí: pueden ser transitorios.
     pub fn reintentable(&self) -> bool {
         match self {
-            Error::Invalida(_) | Error::NoEscribible(_) | Error::Corrupcion(_) => false,
+            Error::Invalida(_)
+            | Error::NoEscribible(_)
+            | Error::Corrupcion(_)
+            | Error::Configuracion(_) => false,
             Error::Interno(_) | Error::Io(_) => true,
         }
     }
@@ -72,6 +82,7 @@ impl fmt::Display for Error {
             Error::Invalida(m) => write!(f, "petición inválida: {m}"),
             Error::NoEscribible(m) => write!(f, "base de datos NO ESCRIBIBLE: {m}"),
             Error::Corrupcion(m) => write!(f, "{m}"),
+            Error::Configuracion(m) => write!(f, "configuración no utilizable: {m}"),
             Error::Interno(m) => write!(f, "fallo interno: {m}"),
             Error::Io(e) => write!(f, "error de E/S: {e}"),
         }
@@ -100,6 +111,7 @@ impl From<Error> for io::Error {
         match e {
             Error::Io(io) => io,
             Error::Invalida(m) => io::Error::new(io::ErrorKind::InvalidInput, m),
+            Error::Configuracion(m) => io::Error::new(io::ErrorKind::InvalidInput, m),
             otro => io::Error::other(otro.to_string()),
         }
     }
@@ -114,6 +126,10 @@ mod tests {
         assert_eq!(Error::Invalida("x").categoria(), "invalida");
         assert_eq!(Error::NoEscribible("x".into()).categoria(), "no-escribible");
         assert_eq!(Error::Corrupcion("x".into()).categoria(), "corrupcion");
+        assert_eq!(
+            Error::Configuracion("x".into()).categoria(),
+            "configuracion"
+        );
         assert_eq!(Error::Interno("x".into()).categoria(), "interno");
         assert_eq!(Error::Io(io::Error::other("x")).categoria(), "io");
     }
@@ -125,6 +141,7 @@ mod tests {
         assert!(!Error::Invalida("clave vacía").reintentable());
         assert!(!Error::NoEscribible("fsync".into()).reintentable());
         assert!(!Error::Corrupcion("crc".into()).reintentable());
+        assert!(!Error::Configuracion("shards=0".into()).reintentable());
         assert!(Error::Interno("invariante".into()).reintentable());
         assert!(Error::Io(io::Error::other("disco lleno")).reintentable());
     }

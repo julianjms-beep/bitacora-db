@@ -83,6 +83,45 @@ ruido y caché caliente, no una mejora—, pero el **p99,9 pasa de 60–204 µs 
 hilos, **6.616/s con la misma garantía**: seis veces más, porque cada `fsync`
 sirve a muchos más escritores a la vez. Es la razón de ser del diseño, medida.
 
+## Lo que costó la observabilidad (Gate 6)
+
+Añadir contadores de operaciones es tocar el camino de cada `put` y cada `get`,
+así que se midió antes de publicarlo, comparando el binario del Gate 6 contra el
+del Gate 5 **alternados** (A/B/A/B) en la misma máquina y el mismo rato, que es
+la única forma de no confundir el cambio con el estado del portátil.
+
+**Lo que salió, y el error que destapó.** Con los contadores en una sola
+estructura global, SET con `fsync=never` bajaba de 141-162k a 104-129k
+operaciones por segundo (**−21 %**) en las cuatro rondas, siempre en la misma
+dirección, mientras el **p50 no se movía** (5,6-6,2 µs frente a 6,1-6,8 µs). Un
+coste que no aparece en la mediana pero sí en el rendimiento agregado es la
+firma de ocho hilos quitándose unos a otros la misma línea de caché.
+
+**El arreglo** fue repartir los contadores por partición del índice, con la
+estructura alineada a 128 bytes para que no comparta línea con el candado del
+mapa. Cada hilo toca entonces, normalmente, una línea distinta, y leerlos no
+cuesta ninguna pasada extra porque `stats()` ya recorría las particiones.
+
+**Después del arreglo no se puede medir la diferencia en esta máquina**, y
+conviene decirlo tal cual en vez de declarar «coste cero». Con 10 rondas
+alternadas:
+
+| | mediana SET (`never`) | rango |
+|---|---|---|
+| Gate 5 | ~153.000 ops/s | 86.000 – 166.000 |
+| Gate 6 | ~139.000 ops/s | 89.000 – 164.000 |
+
+El **mismo** binario del Gate 5 osciló entre 86.000 y 166.000 según la ronda: el
+ruido del portátil es casi el doble, mucho mayor que cualquier efecto que
+quedara. En GET, que es el camino de más frecuencia (un millón de operaciones
+por segundo), los dos quedan indistinguibles: 1.008-1.081k frente a
+1.010-1.077k. Resolver una diferencia de pocos puntos exigiría una máquina
+tranquila y muchas más repeticiones, que es justo lo que esta no es.
+
+De paso, esto es un aviso sobre las cifras de la tabla de arriba: se tomaron en
+un rato tranquilo. El mismo binario, en una máquina cargada, da la mitad. Son
+reproducibles en método, no en valor absoluto.
+
 ## Lo que no se mide, y por qué
 
 * **No hay comparación con Redis.** Una comparación honesta exige igualar la

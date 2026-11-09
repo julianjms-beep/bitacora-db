@@ -29,10 +29,30 @@ use crate::protocol::{parse, Command};
 use crate::store::Db;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Contadores del servidor, separados de los del motor porque cuentan otra
+/// cosa: lo que pasa en la frontera con la red.
+///
+/// Viven en la configuración porque es lo único que comparten `serve` y cada
+/// conexión, y `serve` la deja tras un `Arc`.
+#[derive(Default, Debug)]
+pub struct MetricasServidor {
+    /// Conexiones vivas ahora mismo. **Es también el contador que aplica el
+    /// límite**: una sola fuente de verdad, para que la métrica no pueda
+    /// mentir respecto a la admisión.
+    pub abiertas: AtomicUsize,
+    pub aceptadas: AtomicU64,
+    pub rechazadas_limite: AtomicU64,
+    pub rechazadas_sin_hilos: AtomicU64,
+    pub auth_fallidas: AtomicU64,
+    pub conexiones_en_panic: AtomicU64,
+    pub ordenes: AtomicU64,
+    pub ordenes_invalidas: AtomicU64,
+}
 
 pub struct ServerConfig {
     pub host: String,
@@ -56,6 +76,38 @@ pub struct ServerConfig {
     /// además un indicador global, pero este es por servidor para que varios
     /// en el mismo proceso (o varias pruebas a la vez) no se paren entre sí.
     pub parada: Arc<AtomicBool>,
+    /// Contadores de la frontera de red. Salen por `METRICS`.
+    pub metricas: Arc<MetricasServidor>,
+    /// Dónde puede escribir copias la orden `BACKUP`. `None` (por defecto) la
+    /// desactiva.
+    ///
+    /// **Por qué un directorio fijo y no una ruta del cliente.** Si el cliente
+    /// eligiera la ruta, un `AUTH` válido se convertiría en «escribe ficheros
+    /// donde pueda el usuario del servidor», que es mucho más de lo que da
+    /// acceso a una base de datos. Con esto, el cliente solo elige un nombre y
+    /// el servidor decide el sitio.
+    pub backup_dir: Option<std::path::PathBuf>,
+}
+
+/// Comprueba que `nombre` es **un solo componente de ruta** inofensivo.
+///
+/// Rechaza barras, `..`, nombres ocultos y cualquier cosa que no sea
+/// `[A-Za-z0-9._-]`. Sin esto, `BACKUP ../../etc` escribiría fuera del
+/// directorio de copias.
+fn nombre_de_copia_valido(n: &[u8]) -> Result<&str, &'static str> {
+    if n.is_empty() || n.len() > 64 {
+        return Err("el nombre de la copia tiene que tener entre 1 y 64 caracteres");
+    }
+    if n[0] == b'.' {
+        return Err("el nombre de la copia no puede empezar por punto");
+    }
+    if !n
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+    {
+        return Err("el nombre de la copia solo admite letras, dígitos, punto, guion y guion bajo");
+    }
+    std::str::from_utf8(n).map_err(|_| "el nombre de la copia no es texto válido")
 }
 
 impl ServerConfig {
@@ -72,12 +124,51 @@ impl ServerConfig {
             clave: None,
             permitir_sin_clave: false,
             parada: Arc::new(AtomicBool::new(false)),
+            metricas: Arc::new(MetricasServidor::default()),
+            backup_dir: None,
         }
     }
 
     /// Mando para parar este servidor desde otro hilo.
     pub fn handle_parada(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.parada)
+    }
+
+    /// Comprueba que la configuración del servidor se puede usar. La llama
+    /// `serve` antes de abrir el socket.
+    ///
+    /// Igual que en el motor: solo se rechaza lo que **no hace lo que dice**.
+    /// Un `max_conns` de 1 es raro pero coherente; un `max_conns` de 0 abre un
+    /// puerto que rechaza absolutamente todo, lo cual nunca es lo que se
+    /// pretendía.
+    pub fn validar(&self) -> Result<(), String> {
+        if self.max_conns == 0 {
+            return Err(
+                "max_conns = 0: el servidor escucharía y rechazaría todas las conexiones".into(),
+            );
+        }
+        if self.keys_limit == 0 {
+            return Err("keys_limit = 0: KEYS no devolvería nunca ninguna clave".into());
+        }
+        if self.max_value_bytes == 0 {
+            return Err("max_value_bytes = 0: GET rechazaría todos los valores no vacíos".into());
+        }
+        if let Some(d) = self.read_timeout {
+            if d.is_zero() {
+                return Err("read_timeout = 0 no es «sin límite»: usa None para eso".into());
+            }
+        }
+        if let Some(d) = self.write_timeout {
+            if d.is_zero() {
+                return Err("write_timeout = 0 no es «sin límite»: usa None para eso".into());
+            }
+        }
+        if let Some(c) = &self.clave {
+            if c.is_empty() {
+                return Err("la clave está vacía: cualquier AUTH con cadena vacía entraría".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -114,6 +205,55 @@ pub fn instalar_senales() {
     }
 }
 
+/// Las métricas de la frontera de red, en el mismo formato que las del motor.
+pub fn metricas_servidor(m: &MetricasServidor) -> crate::metricas::Registro {
+    let mut r = crate::metricas::Registro::new();
+    r.gauge(
+        "bitacora_connections",
+        "Conexiones abiertas ahora mismo. Es el mismo contador que aplica el límite.",
+        m.abiertas.load(Ordering::Relaxed) as u64,
+    );
+    r.contador(
+        "bitacora_connections_accepted_total",
+        "Conexiones admitidas desde que arrancó el servidor.",
+        m.aceptadas.load(Ordering::Relaxed),
+    );
+    r.familia(
+        "bitacora_connections_rejected_total",
+        "Conexiones rechazadas, por motivo.",
+        "reason",
+        &[
+            ("limit", m.rechazadas_limite.load(Ordering::Relaxed)),
+            ("no_threads", m.rechazadas_sin_hilos.load(Ordering::Relaxed)),
+        ],
+    );
+    r.contador(
+        "bitacora_auth_failures_total",
+        "Intentos de AUTH con clave incorrecta.",
+        m.auth_fallidas.load(Ordering::Relaxed),
+    );
+    r.contador(
+        "bitacora_conn_panics_total",
+        "Conexiones que terminaron en panic. Si no es 0, hay un fallo que merece informe.",
+        m.conexiones_en_panic.load(Ordering::Relaxed),
+    );
+    r.familia(
+        "bitacora_commands_total",
+        "Órdenes recibidas por el protocolo: todas, y las que no se pudieron ejecutar.",
+        "result",
+        &[
+            (
+                "ok",
+                m.ordenes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(m.ordenes_invalidas.load(Ordering::Relaxed)),
+            ),
+            ("rejected", m.ordenes_invalidas.load(Ordering::Relaxed)),
+        ],
+    );
+    r
+}
+
 fn es_localhost(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost" | "[::1]")
 }
@@ -144,24 +284,31 @@ pub fn serve(db: Arc<Db>, cfg: ServerConfig) -> io::Result<()> {
         )));
     }
 
+    if let Err(e) = cfg.validar() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
+    }
+
     let listener = TcpListener::bind((cfg.host.as_str(), cfg.port))?;
     listener.set_nonblocking(true)?; // M3: para poder mirar si hay que parar
-    eprintln!(
-        "bitacora: escuchando en {}:{} · máx. {} conexiones · un hilo por conexión · \
-         autenticación: {} · espera lectura: {} · KEYS máx. {}",
-        cfg.host,
-        cfg.port,
-        cfg.max_conns,
-        if cfg.clave.is_some() { "sí" } else { "NO" },
-        match cfg.read_timeout {
-            Some(d) => format!("{} s", d.as_secs()),
-            None => "sin límite".into(),
-        },
-        cfg.keys_limit
+    crate::log::info(
+        "server_listening",
+        &[
+            ("host", (&cfg.host).into()),
+            ("port", cfg.port.into()),
+            ("max_conns", cfg.max_conns.into()),
+            ("auth", cfg.clave.is_some().into()),
+            (
+                "read_timeout_s",
+                cfg.read_timeout.map_or(0u64, |d| d.as_secs()).into(),
+            ),
+            ("keys_limit", cfg.keys_limit.into()),
+        ],
     );
 
     let cfg = Arc::new(cfg);
-    let conns = Arc::new(AtomicUsize::new(0));
+    // El contador de conexiones vivas ES la métrica: si fueran dos variables,
+    // una podría decir una cosa y la admisión otra.
+    let conns = Arc::clone(&cfg.metricas);
 
     while !PARAR.load(Ordering::SeqCst) && !cfg.parada.load(Ordering::SeqCst) {
         let stream = match listener.accept() {
@@ -171,7 +318,7 @@ pub fn serve(db: Arc<Db>, cfg: ServerConfig) -> io::Result<()> {
                 continue;
             }
             Err(e) => {
-                eprintln!("bitacora: accept falló: {e}");
+                crate::log::aviso("accept_failed", &[("error", e.to_string().into())]);
                 continue;
             }
         };
@@ -181,6 +328,7 @@ pub fn serve(db: Arc<Db>, cfg: ServerConfig) -> io::Result<()> {
         // comprobación a la vez y superaban el límite.
         let max = cfg.max_conns;
         let admitida = conns
+            .abiertas
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n >= max {
                     None
@@ -190,10 +338,16 @@ pub fn serve(db: Arc<Db>, cfg: ServerConfig) -> io::Result<()> {
             })
             .is_ok();
         if !admitida {
+            conns.rechazadas_limite.fetch_add(1, Ordering::Relaxed);
+            crate::log::aviso(
+                "conn_rejected",
+                &[("reason", "limit".into()), ("max_conns", max.into())],
+            );
             let mut s = &stream;
             let _ = s.write_all(b"ERR interno demasiadas conexiones\n");
             continue;
         }
+        conns.aceptadas.fetch_add(1, Ordering::Relaxed);
 
         // El socket aceptado tiene que ser bloqueante aunque el listener no lo
         // sea: POSIX no define si se hereda.
@@ -206,7 +360,7 @@ pub fn serve(db: Arc<Db>, cfg: ServerConfig) -> io::Result<()> {
         // copia del socket: el original se mueve al hilo.
         let aviso = stream.try_clone().ok();
         let db2 = Arc::clone(&db);
-        let conns2 = Arc::clone(&conns);
+        let conns2 = Arc::clone(&cfg.metricas);
         let cfg2 = Arc::clone(&cfg);
         let r = thread::Builder::new()
             .name("bitacora-conn".into())
@@ -232,40 +386,66 @@ pub fn serve(db: Arc<Db>, cfg: ServerConfig) -> io::Result<()> {
                                 | io::ErrorKind::WouldBlock
                                 | io::ErrorKind::TimedOut
                         ) {
-                            eprintln!("bitacora: conexión cerrada con error: {e}");
+                            crate::log::aviso(
+                                "conn_error",
+                                &[
+                                    ("kind", format!("{:?}", e.kind()).into()),
+                                    ("error", e.to_string().into()),
+                                ],
+                            );
                         }
                     }
-                    Err(_) => eprintln!(
-                        "bitacora: una conexión entró en panic; se cierra solo esa conexión. \
-                         El estado en memoria puede haber quedado a medias: conviene reiniciar"
-                    ),
+                    Err(_) => {
+                        conns2.conexiones_en_panic.fetch_add(1, Ordering::Relaxed);
+                        crate::log::error(
+                            "conn_panicked",
+                            &[(
+                                "note",
+                                "se cierra solo esa conexión; el estado en memoria puede haber \
+                                 quedado a medias y conviene reiniciar"
+                                    .into(),
+                            )],
+                        );
+                    }
                 }
-                conns2.fetch_sub(1, Ordering::SeqCst);
+                conns2.abiertas.fetch_sub(1, Ordering::SeqCst);
             });
 
         // A4: si no se puede crear el hilo (agotamiento, EAGAIN), se rechaza
         // ESTA conexión. Antes el `?` mataba el servidor entero.
         if let Err(e) = r {
-            eprintln!("bitacora: no se pudo crear el hilo de la conexión: {e}");
+            conns.rechazadas_sin_hilos.fetch_add(1, Ordering::Relaxed);
+            crate::log::error(
+                "conn_rejected",
+                &[
+                    ("reason", "no_threads".into()),
+                    ("error", e.to_string().into()),
+                ],
+            );
             if let Some(s) = aviso {
                 let mut s = &s;
                 let _ = s.write_all(b"ERR interno no hay hilos disponibles\n");
             }
-            conns.fetch_sub(1, Ordering::SeqCst);
+            conns.abiertas.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
     // M3: apagado ordenado. Ya no se aceptan conexiones; se espera un rato a
     // que terminen las que estaban en curso.
-    let en_curso = conns.load(Ordering::SeqCst);
-    eprintln!("bitacora: parando · {en_curso} conexión(es) en curso");
+    let en_curso = conns.abiertas.load(Ordering::SeqCst);
+    crate::log::info("server_stopping", &[("open_conns", en_curso.into())]);
     let limite = Instant::now() + Duration::from_secs(5);
-    while conns.load(Ordering::SeqCst) > 0 && Instant::now() < limite {
+    while conns.abiertas.load(Ordering::SeqCst) > 0 && Instant::now() < limite {
         thread::sleep(Duration::from_millis(20));
     }
-    let quedan = conns.load(Ordering::SeqCst);
+    let quedan = conns.abiertas.load(Ordering::SeqCst);
     if quedan > 0 {
-        eprintln!("bitacora: {quedan} conexión(es) no terminaron a tiempo; se cierran");
+        crate::log::aviso(
+            "server_stopped_with_open_conns",
+            &[("open_conns", quedan.into())],
+        );
+    } else {
+        crate::log::info("server_stopped", &[]);
     }
     Ok(())
 }
@@ -295,6 +475,10 @@ pub fn handle(db: &Db, stream: TcpStream, cfg: &ServerConfig) -> io::Result<()> 
         let quit = match parse(&line) {
             Ok(cmd) => execute(db, cmd, &mut wr, cfg, &mut autenticado)?,
             Err(e) => {
+                cfg.metricas.ordenes.fetch_add(1, Ordering::Relaxed);
+                cfg.metricas
+                    .ordenes_invalidas
+                    .fetch_add(1, Ordering::Relaxed);
                 writeln!(wr, "ERR invalida {e}")?;
                 false
             }
@@ -314,8 +498,16 @@ pub fn execute<W: Write>(
     cfg: &ServerConfig,
     autenticado: &mut bool,
 ) -> io::Result<bool> {
+    cfg.metricas.ordenes.fetch_add(1, Ordering::Relaxed);
     // M5: antes de autenticarse solo se puede saludar, autenticarse y salir.
+    //
+    // `HEALTH` y `METRICS` **no** están entre las excepciones a propósito: el
+    // estado interno y los contadores de un servidor no son información
+    // pública. Para un `healthcheck` con clave, `bitacora health --clave`.
     if !*autenticado && !matches!(cmd, Command::Auth(_) | Command::Ping | Command::Quit) {
+        cfg.metricas
+            .ordenes_invalidas
+            .fetch_add(1, Ordering::Relaxed);
         out.write_all(b"ERR invalida hace falta AUTH antes de operar\n")?;
         return Ok(false);
     }
@@ -328,6 +520,11 @@ pub fn execute<W: Write>(
                     out.write_all(b"OK\n")?;
                 } else {
                     *autenticado = false;
+                    cfg.metricas.auth_fallidas.fetch_add(1, Ordering::Relaxed);
+                    // Sin dirección de origen: con un hilo por conexión, quien
+                    // quiera correlacionar tiene el registro del sistema. Y la
+                    // clave intentada NO se registra nunca.
+                    crate::log::aviso("auth_failed", &[]);
                     out.write_all(b"ERR invalida clave incorrecta\n")?;
                 }
             }
@@ -398,6 +595,60 @@ pub fn execute<W: Write>(
                 writeln!(out, "{l}")?;
             }
         }
+        Command::Health => {
+            let s = db.health();
+            writeln!(out, "HEALTH {} {}", s.estado.name(), s.motivos.len())?;
+            for m in &s.motivos {
+                // Un motivo con salto de línea rompería el entramado igual que
+                // un valor (A7). Los motivos los compone el motor, pero el
+                // texto de un error del sistema puede traer cualquier cosa.
+                let m = m.replace(['\n', '\r'], " ");
+                writeln!(out, "{m}")?;
+            }
+        }
+        Command::Metrics => {
+            let mut r = db.metricas();
+            r.anexa(&metricas_servidor(&cfg.metricas));
+            let texto = r.texto();
+            let n = texto.lines().count();
+            writeln!(out, "METRICS {n}")?;
+            out.write_all(texto.as_bytes())?;
+        }
+        Command::Backup(nombre) => match &cfg.backup_dir {
+            None => out.write_all(
+                b"ERR invalida este servidor no tiene directorio de copias: arrancalo con --backup-dir\n",
+            )?,
+            Some(base) => {
+                let predeterminado = format!(
+                    "copia-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs())
+                );
+                let elegido = match nombre {
+                    None => Ok(predeterminado.as_str()),
+                    Some(n) => nombre_de_copia_valido(n),
+                };
+                match elegido {
+                    Err(e) => writeln!(out, "ERR invalida {e}")?,
+                    Ok(n) => {
+                        let destino = base.join(n);
+                        match db.backup(&destino) {
+                            Ok(r) => writeln!(
+                                out,
+                                "OK {} segmentos={} bytes={} last_seq={} ms={:.1}",
+                                destino.display(),
+                                r.segments,
+                                r.bytes,
+                                r.last_seq,
+                                r.ms
+                            )?,
+                            Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
+                        }
+                    }
+                }
+            }
+        },
         Command::Compact => match db.compact() {
             Ok(r) if r.ran => writeln!(
                 out,

@@ -292,3 +292,42 @@ Cada fase acaba con pruebas en verde y se puede parar ahí.
 | **5** | Benchmarks reproducibles con p50/p95/p99 y RAM; medición durante compactación y al recuperar | Medir antes de optimizar |
 | **6** | Observabilidad: líneas JSON, métricas, `HEALTH`, documentación operativa, copia y restauración | Lo necesario para operarlo |
 | **7** | Batch, CAS, TTL, namespaces | Funcionalidad, solo sobre una base sólida |
+
+---
+
+# Hallazgos posteriores a la auditoría
+
+Esta auditoría se cerró el 8 de noviembre de 2026. Lo que sigue salió
+**después**, trabajando en los gates, y se deja aquí separado para no
+reescribir la fecha de un documento.
+
+## C4 · Dos procesos podían abrir el mismo directorio de datos
+
+*Encontrado el 9 de noviembre de 2026, durante el Gate 6, al diseñar la copia
+de seguridad. Arreglado en el mismo gate.*
+
+No había nada que impidiera que dos procesos abrieran la misma carpeta. Los dos
+calculaban por separado el mismo número de segmento activo (`ids.last() + 1`) y
+el mismo `next_seq`, abrían el mismo `NNNNNN.log` en modo añadir —cada uno con
+su propio contador de por dónde iba el fichero— y escribían entremezclados,
+duplicando además los números de secuencia que la recuperación usa para decidir
+qué versión de una clave gana. Bastaba con arrancar dos veces `bitacora serve
+--dir data`.
+
+Es de la misma gravedad que C1-C3 y se pasó por alto en la auditoría. Salió al
+preguntarse una cosa concreta: si `bitacora backup --dir X` abre la base de
+datos para copiarla, ¿qué pasa si un servidor la tiene abierta? La respuesta
+era «nada, y ahí está el problema».
+
+**Arreglo**: `flock` exclusivo sobre `<dir>/LOCK` al abrir, suelto en `close()`.
+Ver `CAMBIOS.md` y `OPERACION.md`. **Límite conocido**: sobre NFS `flock` no es
+de fiar.
+
+## Sobre M5 y la orden `BACKUP`
+
+Al añadir la copia por el protocolo apareció una decisión que no estaba
+contemplada: si el cliente eligiera la ruta de destino, un `AUTH` válido se
+convertiría en permiso para escribir ficheros en cualquier sitio donde pueda el
+usuario del servidor, que es bastante más de lo que da acceso a una base de
+datos. Por eso el servidor fija el directorio (`--backup-dir`) y el cliente
+solo elige un nombre validado.

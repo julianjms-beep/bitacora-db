@@ -5,16 +5,22 @@
 //! - `store`: el motor (índice en memoria por shards + segmentos en disco,
 //!   fsync por grupos, compactación concurrente).
 //! - `protocol` y `server`: protocolo de texto por TCP, un hilo por conexión.
+//! - `log`: emisor de eventos (texto o JSON por línea), sin dependencias.
 
 pub mod crc32;
 pub mod error;
+pub mod log;
+pub mod metricas;
 pub mod protocol;
 pub mod server;
 pub mod store;
 pub mod wal;
 
 pub use error::{Error, Result};
-pub use store::{CompactReport, Db, FsyncPolicy, Options, RecoveryPolicy, RecoveryReport, Stats};
+pub use store::{
+    BackupReport, CompactReport, Db, Estado, FsyncPolicy, Options, RecoveryPolicy, RecoveryReport,
+    Salud, Stats,
+};
 
 /// Valor determinista para la clave `k{i}`; lo usan la prueba de apagón y el bench.
 pub fn demo_value(i: u64) -> Vec<u8> {

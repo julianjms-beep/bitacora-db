@@ -1,8 +1,8 @@
 # Cambios incompatibles
 
-Los tres primeros gates de endurecimiento (8 de noviembre de 2026) han
-introducido cambios que rompen compatibilidad. Están todos aquí, con qué hacer
-en cada caso.
+Los gates de endurecimiento (8 y 9 de noviembre de 2026) han introducido
+cambios que rompen compatibilidad. Están todos aquí, por gate, con qué hacer en
+cada caso.
 
 **El formato binario del WAL no ha cambiado en ninguno de ellos.** Los ficheros
 de datos escritos antes se siguen leyendo sin migración.
@@ -227,3 +227,127 @@ que induce a error (y lo avisaba clippy). Solo afecta a quien use
 
 La CI, el formato, las pruebas por propiedades y el barrido aleatorio no tocan
 la API ni el protocolo.
+
+---
+
+## Gate 5 — banco de pruebas
+
+### Nada cambia
+
+El banco (`bitacora bench`) se reescribió con percentiles exactos, medición
+durante la compactación y tiempo de reapertura. No toca la API, el protocolo ni
+el formato de los datos.
+
+---
+
+## Gate 6 — observabilidad y operación
+
+**El formato binario del WAL sigue sin cambiar.** Los datos escritos por
+cualquier versión anterior se leen sin migración.
+
+### Un segundo proceso ya no puede abrir el mismo directorio
+
+Es el cambio más importante de este gate, y cierra un agujero que **no estaba
+en el informe de auditoría**: nada impedía que dos procesos abrieran la misma
+carpeta de datos. Los dos calculaban por separado el mismo número de segmento y
+el mismo número de secuencia, abrían el mismo `NNNNNN.log` en modo añadir con
+su propia idea de por dónde iba, y escribían entremezclados duplicando los
+`seq` que la recuperación usa para decidir qué versión de una clave gana.
+Bastaba con arrancar dos veces `bitacora serve --dir data`.
+
+Ahora `Db::open` toma un `flock` exclusivo sobre `<dir>/LOCK` y falla con
+`Error::Configuracion` si otro proceso lo tiene. El bloqueo lo suelta el núcleo
+cuando el proceso muere, muera como muera, así que un `kill -9` o un apagón no
+dejan un bloqueo fantasma. `close()` lo suelta antes de devolver, de modo que
+reabrir justo después funciona siempre y no «casi siempre».
+
+*Qué hacer:* nada, salvo que tuvieras dos procesos sobre la misma carpeta, en
+cuyo caso lo que tenías era corrupción silenciosa. **Sobre NFS `flock` no es de
+fiar**, y ahí este bloqueo no protege.
+
+### `Error` tiene una variante nueva: `Configuracion`
+
+Rompe cualquier `match` exhaustivo sobre `Error` sin brazo `_`. Su
+`categoria()` es `"configuracion"` y `reintentable()` es `false`: hay que
+cambiar la configuración, no reintentar.
+
+### `Db::open` valida la configuración antes de tocar el disco
+
+Se rechaza lo que **no hace lo que dice**, con un mensaje que explica qué
+pasaba antes:
+
+| Valor | Qué hacía |
+|---|---|
+| `shards = 0` | Se convertía en 1 **en silencio** |
+| `group_interval = 0` con `fsync = group` | **Medido**: 100 % de un núcleo con el servidor ocioso, frente a 0,5 % con 2 ms |
+| `compact_dead_ratio` fuera de [0, 1] o `NaN` | Por encima de 1 deja la auto-compactación activada y sin dispararse jamás |
+| `read_retry_timeout = 0` | Un `get` que coincidiera con el final de una compactación devolvía error interno en la primera vuelta |
+| `shards > 65536` | Cada `STATS`, `KEYS` o `len()` toma un candado por partición |
+
+Lo que **no** se valida es igual de deliberado: `max_segment_bytes` no tiene
+mínimo. Un segmento pequeño hace exactamente lo que dice —muchos ficheros— y es
+una decisión de quien configura. Hubo un mínimo durante el desarrollo de este
+gate y lo único que conseguía era romper pruebas que quieren provocar cierres
+de segmento.
+
+### `ServerConfig::validar` y dos campos nuevos
+
+`serve` valida antes de abrir el socket y devuelve `InvalidInput` si
+`max_conns`, `keys_limit` o `max_value_bytes` son 0, si un tiempo de espera es
+`Some(0)` (que no es «sin límite»: eso es `None`) o si la clave está vacía.
+
+`ServerConfig` gana `metricas: Arc<MetricasServidor>` y
+`backup_dir: Option<PathBuf>`. Construirlo con literal de struct se rompe;
+`ServerConfig::new`, que es la vía documentada, no.
+
+### `Stats` tiene quince campos y quince líneas más
+
+`estado` (`ok`/`aviso`/`critico`) y los contadores de operaciones. **`health`
+no cambia de significado**: sigue siendo `ok` o `no-escribible (motivo)`, para
+no romper a quien ya lo vigile. `STATS` anuncia su número de líneas, así que un
+cliente que lo lea no se entera; uno que las tuviera contadas a mano, sí.
+Construir `Stats` con literal de struct se rompe.
+
+### El protocolo gana tres órdenes
+
+```text
+HEALTH          -> HEALTH <ok|aviso|critico> <n> seguido de n motivos
+METRICS         -> METRICS <n> seguido de n líneas en formato Prometheus
+BACKUP [nombre] -> OK <ruta> segmentos=.. bytes=.. last_seq=.. ms=..
+```
+
+Las tres **exigen `AUTH`** si el servidor tiene clave: el estado interno y los
+contadores no son información pública. `BACKUP` solo existe si el servidor
+arrancó con `--backup-dir`, y el cliente elige **un nombre, no una ruta**: se
+rechaza cualquier cosa con barras, `..`, punto inicial o caracteres fuera de
+`[A-Za-z0-9._-]`. Si el cliente pudiera dar la ruta, un `AUTH` válido sería
+permiso para escribir ficheros donde pueda el usuario del servidor.
+
+`Command` gana las variantes `Health`, `Metrics` y `Backup`, lo que rompe un
+`match` exhaustivo sobre él.
+
+### La salida por `stderr` del servidor cambia de forma
+
+Donde había prosa en español hay ahora una línea por evento con campos
+nombrados, en texto o en JSON (`--log`, `--log-nivel`, `--log-fichero`). El
+catálogo completo está en `OPERACION.md`. No es una API, pero quien tuviera un
+`grep` sobre esas líneas tendrá que cambiarlo.
+
+Dos consecuencias buscadas: **nunca se registran claves ni valores** —un log
+con las claves del cliente sería una copia parcial de los datos con otros
+permisos y otra retención—, y el detalle de la apertura lo emite el motor en
+`engine_opened`, no `main`, para que no haya dos versiones de la misma verdad.
+
+### Métodos nuevos
+
+`Db::health()`, `Db::metricas()`, `Db::backup()`, `Options::validar()`,
+`ServerConfig::validar()`, y los tipos `Estado`, `Salud`, `BackupReport`,
+`MetricasServidor`. Los módulos `log` y `metricas` son nuevos y públicos.
+
+### Los contadores van por partición, y por qué importa
+
+Está medido en `RENDIMIENTO.md`: con los contadores en una sola estructura
+global, SET con `fsync=never` bajaba un 21 % mientras el p50 no se movía —ocho
+hilos peleándose por la misma línea de caché—. Repartidos por partición del
+índice y alineados a 128 bytes, la diferencia deja de ser medible en esta
+máquina. No afecta a la API.

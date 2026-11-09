@@ -8,7 +8,7 @@ use common::{segments, TempDir};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn opts(dir: &std::path::Path) -> Options {
     let mut o = Options::new(dir);
@@ -36,7 +36,34 @@ fn sobrevive_a_un_kill_9_a_mitad_de_escritura() {
             .stderr(Stdio::null())
             .spawn()
             .expect("lanzar escritor");
-        thread::sleep(Duration::from_millis(350));
+
+        // Esperar a que el hijo esté escribiendo de verdad, en vez de confiar
+        // en un plazo fijo. Con la máquina cargada —varios binarios de prueba
+        // a la vez— 350 ms podían no bastar ni para que arrancara, y entonces
+        // lo que fallaba era el reloj de la prueba, no el motor.
+        //
+        // Sigue siendo un `kill -9` a mitad de escritura: el hijo escribe en
+        // un bucle sin fin, así que cuando se le mata está siempre a medias.
+        let bytes_al_empezar = common::disk_bytes(tmp.path());
+        let limite = Instant::now() + Duration::from_secs(20);
+        let mut arranco = false;
+        while Instant::now() < limite {
+            if common::disk_bytes(tmp.path()) > bytes_al_empezar {
+                arranco = true;
+                // Un poco más, para estar en mitad del log y no en el primer
+                // registro.
+                thread::sleep(Duration::from_millis(100));
+                break;
+            }
+            if let Ok(Some(estado)) = child.try_wait() {
+                panic!("ronda {ronda}: el escritor murió solo con estado {estado}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            arranco,
+            "ronda {ronda}: el escritor no escribió nada en 20 s"
+        );
         child.kill().expect("kill -9");
         let _ = child.wait();
 

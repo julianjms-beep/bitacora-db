@@ -192,6 +192,86 @@ impl Options {
             fsync_falla_tras: None,
         }
     }
+
+    /// Comprueba que la configuración se puede usar. La llama [`Db::open`]
+    /// antes de tocar un solo fichero.
+    ///
+    /// Ninguno de estos valores fallaba al abrir: fallaban después, y de formas
+    /// que no se relacionan fácilmente con su causa. Cada comprobación dice
+    /// **qué pasa exactamente** si se deja pasar, y todas están medidas o se
+    /// siguen directamente del código:
+    ///
+    /// * `shards: 0` no abortaba: se convertía en 1 en silencio
+    ///   (`opts.shards.max(1)`). Pedir 0 particiones y recibir 1 sin que nadie
+    ///   lo diga es exactamente el tipo de cosa que luego aparece como
+    ///   «contención inexplicable».
+    /// * `group_interval: 0` con `fsync: group` deja al hilo de sincronización
+    ///   sin dormir nunca. **Medido**: 100 % de un núcleo con el servidor
+    ///   ocioso y sin una sola conexión, frente a 0,5 % con 2 ms.
+    /// * `compact_dead_ratio > 1.0` desactiva la auto-compactación **sin
+    ///   desactivarla**: la proporción real nunca puede pasar de 1, así que la
+    ///   condición no se cumple jamás y el disco crece sin límite con
+    ///   `auto_compact: true`.
+    ///
+    /// Lo que **no** se comprueba es igual de deliberado: un valor que haga el
+    /// motor lento pero que haga lo que dice no es un error de configuración.
+    /// Ver el comentario sobre `max_segment_bytes` dentro de la función.
+    pub fn validar(&self) -> Result<()> {
+        if self.shards == 0 {
+            return Err(Error::Configuracion(
+                "shards = 0 no tiene sentido; hasta ahora se convertía en 1 en silencio".into(),
+            ));
+        }
+        // Cada `STATS`, `KEYS` o `len()` toma un candado por shard, así que el
+        // número de particiones no es gratis en el otro extremo.
+        const MAX_SHARDS: usize = 65_536;
+        if self.shards > MAX_SHARDS {
+            return Err(Error::Configuracion(format!(
+                "shards = {}: el máximo es {MAX_SHARDS}. Cada STATS, KEYS o len() \
+                 toma un candado por partición, así que pasado ese punto se paga \
+                 más al observar de lo que se ahorra en contención",
+                self.shards
+            )));
+        }
+        // Aquí había un mínimo para `max_segment_bytes`. Está quitado a
+        // propósito, y conviene no volver a ponerlo: un segmento pequeño hace
+        // exactamente lo que dice —muchos ficheros, un fsync de directorio por
+        // cierre—, y eso es una decisión de quien configura, no un error. Las
+        // comprobaciones de aquí son para valores que NO hacen lo que dicen.
+        // Además, el motor no necesita ningún mínimo: `put` solo cierra el
+        // segmento si ya tiene algo escrito, así que un registro más grande que
+        // el tamaño máximo siempre cabe (ver B1 en docs/AUDITORIA.md). Un
+        // mínimo aquí solo serviría para que las pruebas que quieren provocar
+        // cierres de segmento no pudieran hacerlo.
+        if self.fsync == FsyncPolicy::Group && self.group_interval.is_zero() {
+            return Err(Error::Configuracion(
+                "group_interval = 0 con fsync = group: el hilo de sincronización no \
+                 llegaría a dormir nunca. Medido: 100 % de un núcleo con el servidor \
+                 ocioso, frente a 0,5 % con 2 ms"
+                    .into(),
+            ));
+        }
+        if !self.compact_dead_ratio.is_finite()
+            || self.compact_dead_ratio < 0.0
+            || self.compact_dead_ratio > 1.0
+        {
+            return Err(Error::Configuracion(format!(
+                "compact_dead_ratio = {} tiene que estar entre 0 y 1: la proporción real \
+                 de bytes muertos nunca pasa de 1, así que un umbral mayor deja la \
+                 auto-compactación activada y sin dispararse jamás",
+                self.compact_dead_ratio
+            )));
+        }
+        if self.read_retry_timeout.is_zero() {
+            return Err(Error::Configuracion(
+                "read_retry_timeout = 0: un get que coincida con el final de una \
+                 compactación devolvería un error interno en la primera vuelta, en vez \
+                 de volver a mirar el índice, que es lo único que hace falta"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Marca temporal de "borrado" en el índice mientras se reconstruye el estado.
@@ -236,8 +316,38 @@ fn fnv1a(key: &[u8]) -> u64 {
     h
 }
 
+/// Contadores de una partición.
+///
+/// **Por qué por partición y no uno global.** Con un contador global, los ocho
+/// hilos hacen `fetch_add` sobre la misma línea de caché y se la van quitando
+/// unos a otros. Medido en este motor: con contadores globales, SET con
+/// `fsync=never` bajaba de 141-162k a 104-129k operaciones por segundo (−21 %)
+/// mientras el p50 **no** se movía (5,6-6,2 µs → 6,1-6,8 µs). Un coste que no
+/// aparece en la mediana pero sí en el rendimiento agregado es exactamente eso:
+/// paradas cortas por contención de caché. Repartidos por partición, cada hilo
+/// toca normalmente una línea distinta.
+///
+/// `align(128)` separa estos contadores del candado del mapa de la misma
+/// partición. Si compartieran línea, un `fetch_add` obligaría a pedir la línea
+/// en exclusiva y frenaría a los lectores que solo querían el candado de
+/// lectura. 128 y no 64 porque es el tamaño de línea de los Apple Silicon.
+#[repr(align(128))]
+#[derive(Default)]
+struct ContadoresShard {
+    puts: AtomicU64,
+    gets: AtomicU64,
+    gets_hit: AtomicU64,
+    deletes: AtomicU64,
+    deletes_hit: AtomicU64,
+    errores: AtomicU64,
+    bytes_escritos: AtomicU64,
+    bytes_leidos: AtomicU64,
+    get_reintentos: AtomicU64,
+}
+
 struct Shard {
     map: RwLock<HashMap<Box<[u8]>, Loc>>,
+    ops: ContadoresShard,
 }
 
 impl Shard {
@@ -251,6 +361,30 @@ impl Shard {
             }
         }
     }
+}
+
+/// Contadores globales de observabilidad: solo los de eventos raros.
+///
+/// Los de operaciones van por partición en [`ContadoresShard`], porque un
+/// contador global en el camino de cada operación cuesta rendimiento medible.
+/// Aquí solo quedan cosas que pasan una vez cada mucho, donde la contención no
+/// existe.
+///
+/// Son `Relaxed` a propósito: se leen para **mirar**, nunca para decidir, así
+/// que ver un valor un instante desfasado no cambia ningún comportamiento. Los
+/// de `live`/`dead`, que sí deciden cuándo compactar, están aparte y tienen su
+/// propio cuidado (M2).
+#[derive(Default)]
+struct Contadores {
+    compactaciones: AtomicU64,
+    compactaciones_fallidas: AtomicU64,
+    copias: AtomicU64,
+    copias_fallidas: AtomicU64,
+}
+
+#[inline]
+fn mas(a: &AtomicU64, n: u64) {
+    a.fetch_add(n, Ordering::Relaxed);
 }
 
 struct Writer {
@@ -276,12 +410,25 @@ struct Inner {
     synced_cv: Condvar,
     sync_req: Mutex<bool>,
     sync_req_cv: Condvar,
-    /// Cuántos `fsync` se han hecho. Solo se cuenta con inyección de fallos.
+    /// Cuántos `fsync` se han intentado. Lo usa la inyección de fallos y sale
+    /// en las métricas.
     syncs_hechos: AtomicU64,
     stop: AtomicBool,
     compacting: AtomicBool,
     live: AtomicU64,
     dead: AtomicU64,
+    /// Candado de **retirada de segmentos**. Lo toma la compactación justo
+    /// antes de sacar los segmentos viejos del mapa y borrarlos, y lo sostiene
+    /// la copia de seguridad durante toda la copia: así nadie puede borrar un
+    /// segmento a medio copiar.
+    ///
+    /// Orden de candados: `retirada` **antes** que `segments` y que `writer`.
+    /// Al revés habría inversión: la copia sostendría `retirada` esperando
+    /// `segments`, y la compactación sostendría `segments` esperando
+    /// `retirada`.
+    retirada: Mutex<()>,
+    /// Contadores de observabilidad.
+    ops: Contadores,
     /// Qué pasó al reconstruir el índice al abrir.
     recovery: RecoveryReport,
 }
@@ -290,6 +437,12 @@ pub struct Db {
     inner: Arc<Inner>,
     syncer: Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
+    /// Descriptor del fichero de bloqueo. Se suelta en `close()`, **no** al
+    /// destruirse `Inner`: un hilo de compactación todavía vivo conserva su
+    /// `Arc<Inner>` unos instantes, y el bloqueo tiene que estar libre en
+    /// cuanto `close()` devuelve, para que reabrir justo después funcione
+    /// siempre y no «casi siempre».
+    bloqueo: Mutex<Option<File>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -304,12 +457,30 @@ pub struct Stats {
     pub synced_seq: u64,
     pub fsync: String,
     pub compacting: bool,
-    /// `ok`, o `no-escribible (motivo)` si un `fsync` falló.
+    /// `ok`, o `no-escribible (motivo)` si un `fsync` falló. **No cambia de
+    /// significado**: sigue mirando solo la durabilidad, como siempre. Para el
+    /// estado completo está `estado` y la orden `HEALTH`.
     pub health: String,
+    /// `ok`, `aviso` o `critico`: ver [`Estado`].
+    pub estado: String,
     /// Zonas ilegibles saltadas al abrir. Si no es 0, **se perdieron datos**.
     pub recovery_corrupt_records: u64,
     pub recovery_corrupt_bytes: u64,
     pub recovery_truncated_tails: u64,
+    pub ops_put: u64,
+    pub ops_get: u64,
+    pub ops_get_hit: u64,
+    pub ops_delete: u64,
+    pub ops_delete_hit: u64,
+    pub ops_errors: u64,
+    pub bytes_written: u64,
+    pub bytes_read: u64,
+    pub get_retries: u64,
+    pub fsyncs: u64,
+    pub compactions: u64,
+    pub compactions_failed: u64,
+    pub backups: u64,
+    pub backups_failed: u64,
 }
 
 impl Stats {
@@ -326,11 +497,83 @@ impl Stats {
             format!("fsync {}", self.fsync),
             format!("compacting {}", self.compacting),
             format!("health {}", self.health),
+            format!("estado {}", self.estado),
             format!("recovery_corrupt_records {}", self.recovery_corrupt_records),
             format!("recovery_corrupt_bytes {}", self.recovery_corrupt_bytes),
             format!("recovery_truncated_tails {}", self.recovery_truncated_tails),
+            format!("ops_put {}", self.ops_put),
+            format!("ops_get {}", self.ops_get),
+            format!("ops_get_hit {}", self.ops_get_hit),
+            format!("ops_delete {}", self.ops_delete),
+            format!("ops_delete_hit {}", self.ops_delete_hit),
+            format!("ops_errors {}", self.ops_errors),
+            format!("bytes_written {}", self.bytes_written),
+            format!("bytes_read {}", self.bytes_read),
+            format!("get_retries {}", self.get_retries),
+            format!("fsyncs {}", self.fsyncs),
+            format!("compactions {}", self.compactions),
+            format!("compactions_failed {}", self.compactions_failed),
+            format!("backups {}", self.backups),
+            format!("backups_failed {}", self.backups_failed),
         ]
     }
+}
+
+/// Estado de salud del motor. Lo devuelve [`Db::health`] y sale por la orden
+/// `HEALTH` del protocolo.
+///
+/// **Lo que esto es y lo que no**: informa de fallos que el motor *ya conoce*
+/// —un `fsync` que falló, datos que se perdieron al recuperar, una cola
+/// recortada—. No es una sonda: no comprueba que el disco siga respondiendo ni
+/// mide latencias, porque nada en el motor las mide. Un disco que se ha vuelto
+/// lento, o que se llenará en una hora, sale aquí como `ok` hasta que una
+/// operación falla de verdad.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum Estado {
+    /// Nada que señalar.
+    #[default]
+    Ok,
+    /// Algo merece una mirada, pero el motor funciona con todas sus garantías.
+    Aviso,
+    /// Hay pérdida de datos o el motor no acepta escrituras. Exige intervención.
+    Critico,
+}
+
+impl Estado {
+    pub fn name(self) -> &'static str {
+        match self {
+            Estado::Ok => "ok",
+            Estado::Aviso => "aviso",
+            Estado::Critico => "critico",
+        }
+    }
+
+    /// Para un `healthcheck` de contenedor o de systemd: 0 si se puede seguir,
+    /// 1 si hace falta intervenir.
+    pub fn codigo_salida(self) -> i32 {
+        match self {
+            Estado::Ok | Estado::Aviso => 0,
+            Estado::Critico => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Salud {
+    pub estado: Estado,
+    /// Un motivo por línea, en orden de gravedad. Vacío si el estado es `ok`.
+    pub motivos: Vec<String>,
+}
+
+/// Resultado de una copia de seguridad en caliente ([`Db::backup`]).
+#[derive(Clone, Debug, Default)]
+pub struct BackupReport {
+    pub segments: u64,
+    pub bytes: u64,
+    /// Último número de secuencia que contiene la copia. Todo lo escrito
+    /// después del corte **no** está.
+    pub last_seq: u64,
+    pub ms: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -339,6 +582,63 @@ pub struct CompactReport {
     pub segments_removed: usize,
     pub bytes_before: u64,
     pub bytes_after: u64,
+}
+
+/// Fichero de bloqueo del directorio. No acaba en `.log`, así que ni la
+/// reconstrucción del índice ni la copia de seguridad lo miran.
+const LOCK: &str = "LOCK";
+
+/// Toma el bloqueo exclusivo del directorio de datos.
+///
+/// **Por qué hace falta.** Dos procesos que abren la misma carpeta calculan por
+/// separado el mismo `next_id` y el mismo `next_seq`. Los dos abren
+/// `NNNNNN.log` en modo añadir, cada uno con su propia idea de por dónde va el
+/// fichero, y escriben entremezclados; además repiten números de secuencia, que
+/// es justo lo que usa la recuperación para decidir qué versión de una clave
+/// gana. No es un riesgo teórico: bastaba con arrancar dos veces
+/// `bitacora serve --dir data`.
+///
+/// **Por qué `flock` y no un fichero con el PID.** El núcleo suelta el bloqueo
+/// cuando el proceso muere, muera como muera, así que un `kill -9` o un apagón
+/// no dejan un bloqueo fantasma que haya que limpiar a mano. Y a diferencia de
+/// los cerrojos de `fcntl`, los de `flock` van asociados al descriptor abierto,
+/// así que también protegen contra dos `Db::open` en el **mismo** proceso.
+///
+/// **Límite conocido**: sobre NFS, `flock` no es de fiar. Ahí este bloqueo no
+/// protege, y conviene no compartir un directorio de datos por red.
+fn toma_bloqueo(dir: &Path) -> Result<File> {
+    use std::os::fd::AsRawFd;
+    let ruta = dir.join(LOCK);
+    // `truncate(false)` a propósito: si el bloqueo lo tiene otro proceso, este
+    // `open` no debe borrarle el PID que dejó escrito. Se trunca más abajo,
+    // solo si el bloqueo acaba siendo nuestro.
+    let f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&ruta)?;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    extern "C" {
+        fn flock(fd: i32, op: i32) -> i32;
+    }
+    // SAFETY: `f` sigue vivo durante toda la llamada, así que el descriptor es
+    // válido. `flock` solo recibe un entero y una operación y no guarda nada.
+    let r = unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if r != 0 {
+        let e = io::Error::last_os_error();
+        return Err(Error::Configuracion(format!(
+            "el directorio {} ya lo tiene abierto otro proceso ({e}). Dos procesos \
+             escribiendo en el mismo directorio eligen el mismo número de segmento y \
+             el mismo número de secuencia, y el resultado son registros entremezclados",
+            dir.display()
+        )));
+    }
+    // El PID es solo para que un humano pueda ver quién lo tiene. Que no se
+    // pueda escribir no es motivo para no abrir: el bloqueo ya está tomado.
+    let _ = f.set_len(0);
+    let _ = (&f).write_all(format!("{}\n", std::process::id()).as_bytes());
+    Ok(f)
 }
 
 fn seg_path(dir: &Path, id: u32) -> PathBuf {
@@ -446,7 +746,13 @@ impl Db {
     /// los segmentos. Si el último registro de un fichero está a medias, lo
     /// recorta: así se recupera de un apagón.
     pub fn open(opts: Options) -> Result<Db> {
+        // Antes de crear el directorio: una configuración inutilizable no debe
+        // dejar rastro en el disco.
+        opts.validar()?;
+        let t_abrir = Instant::now();
         fs::create_dir_all(&opts.dir)?;
+        // Un solo escritor por directorio, y se comprueba antes de leer nada.
+        let bloqueo = toma_bloqueo(&opts.dir)?;
         let mut ids: Vec<u32> = Vec::new();
         for entry in fs::read_dir(&opts.dir)? {
             let name = entry?.file_name();
@@ -459,10 +765,13 @@ impl Db {
         }
         ids.sort_unstable();
 
+        // `validar()` ya garantiza que no es 0; el `max(1)` se queda como
+        // cinturón por si alguien construye el motor por otra vía.
         let nsh = opts.shards.max(1);
         let shards: Vec<Shard> = (0..nsh)
             .map(|_| Shard {
                 map: RwLock::new(HashMap::new()),
+                ops: ContadoresShard::default(),
             })
             .collect();
         let mut segments: HashMap<u32, Arc<File>> = HashMap::new();
@@ -588,15 +897,17 @@ impl Db {
                     }
                     // La copia de seguridad no sirve de nada si no es durable.
                     sync_dir(&opts.dir)?;
-                    eprintln!(
-                        "bitacora: AVISO — recuperación CON PÉRDIDAS: {} zona(s) ilegible(s), {} byte(s). \
-                         Copia previa de {} segmento(s) en .corrupto-{ts}",
-                        report.corrupt_records,
-                        report.corrupt_bytes,
-                        report.quarantined.len()
+                    crate::log::error(
+                        "recovery_data_loss",
+                        &[
+                            ("corrupt_records", report.corrupt_records.into()),
+                            ("corrupt_bytes", report.corrupt_bytes.into()),
+                            ("quarantined", report.quarantined.len().into()),
+                            ("quarantine_suffix", format!(".corrupto-{ts}").into()),
+                        ],
                     );
                     for d in &report.detalle {
-                        eprintln!("bitacora:   - {d}");
+                        crate::log::error("recovery_detail", &[("detail", d.into())]);
                     }
                 }
             }
@@ -605,9 +916,13 @@ impl Db {
         // Solo ahora se toca el disco, y solo para quitar colas que nunca se
         // confirmaron a ningún cliente.
         for (path, file, at) in pending_truncate {
-            eprintln!(
-                "bitacora: {} acaba en una escritura incompleta; se recorta en el byte {at}",
-                path.display()
+            crate::log::aviso(
+                "recovery_tail_truncated",
+                &[
+                    ("file", crate::log::ruta(&path)),
+                    ("at", at.into()),
+                    ("note", "bytes nunca confirmados a ningún cliente".into()),
+                ],
             );
             file.set_len(at)?;
             file.sync_all()?;
@@ -663,6 +978,8 @@ impl Db {
             compacting: AtomicBool::new(false),
             live: AtomicU64::new(live),
             dead: AtomicU64::new(total.saturating_sub(live)),
+            retirada: Mutex::new(()),
+            ops: Contadores::default(),
             recovery: report,
         });
 
@@ -677,14 +994,52 @@ impl Db {
             None
         };
 
+        let claves: usize = inner.shards.iter().map(|s| rd(&s.map).len()).sum();
+        crate::log::info(
+            "engine_opened",
+            &[
+                ("dir", crate::log::ruta(&inner.opts.dir)),
+                ("keys", claves.into()),
+                ("segments", inner.recovery.segments.into()),
+                ("disk_bytes", total.into()),
+                ("fsync", fsync.name().into()),
+                ("full_fsync", inner.opts.full_fsync.into()),
+                ("shards", inner.opts.shards.into()),
+                ("recovery", inner.opts.recovery.name().into()),
+                ("ms", (t_abrir.elapsed().as_secs_f64() * 1000.0).into()),
+                // Si esto es `true`, la recuperación NO fue íntegra. Va en el
+                // evento de apertura para que no haga falta cruzar dos líneas.
+                ("data_loss", inner.recovery.con_perdidas().into()),
+            ],
+        );
+
         Ok(Db {
             inner,
             syncer: Mutex::new(syncer),
             closed: AtomicBool::new(false),
+            bloqueo: Mutex::new(Some(bloqueo)),
         })
     }
 
+    /// Escribe (o sobrescribe) una clave. Con `fsync: group` no vuelve hasta
+    /// que el registro está en disco.
+    ///
+    /// Es un envoltorio sobre `put_interno` que solo cuenta: así el camino
+    /// caliente queda intacto y los contadores no se cuelan entre los candados.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let r = self.put_interno(key, value);
+        let c = &self.inner.shard(key).ops;
+        match &r {
+            Ok(()) => {
+                mas(&c.puts, 1);
+                mas(&c.bytes_escritos, rec_len(key.len(), value.len() as u32));
+            }
+            Err(_) => mas(&c.errores, 1),
+        }
+        r
+    }
+
+    fn put_interno(&self, key: &[u8], value: &[u8]) -> Result<()> {
         validate(key, Some(value))?;
         let inner = &*self.inner;
         inner.check_writable()?;
@@ -745,7 +1100,24 @@ impl Db {
         Ok(())
     }
 
+    /// Lee el valor de una clave. Los valores no están en memoria: esto va al
+    /// disco (o a la caché de páginas del sistema).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let r = self.get_interno(key);
+        let c = &self.inner.shard(key).ops;
+        mas(&c.gets, 1);
+        match &r {
+            Ok(Some(v)) => {
+                mas(&c.gets_hit, 1);
+                mas(&c.bytes_leidos, v.len() as u64);
+            }
+            Ok(None) => {}
+            Err(_) => mas(&c.errores, 1),
+        }
+        r
+    }
+
+    fn get_interno(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let inner = &*self.inner;
         let shard = inner.shard(key);
         // La compactación puede retirar un segmento entre que se consulta el
@@ -771,6 +1143,7 @@ impl Db {
                 return Ok(Some(buf));
             }
             vueltas += 1;
+            mas(&shard.ops.get_reintentos, 1);
             if Instant::now() >= limite {
                 return Err(Error::Interno(format!(
                     "la clave está en el índice pero su segmento \
@@ -800,6 +1173,22 @@ impl Db {
 
     /// Devuelve `true` si la clave existía. Escribe una lápida en el log.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        let r = self.delete_interno(key);
+        let c = &self.inner.shard(key).ops;
+        match &r {
+            Ok(habia) => {
+                mas(&c.deletes, 1);
+                if *habia {
+                    mas(&c.deletes_hit, 1);
+                    mas(&c.bytes_escritos, rec_len(key.len(), 0));
+                }
+            }
+            Err(_) => mas(&c.errores, 1),
+        }
+        r
+    }
+
+    fn delete_interno(&self, key: &[u8]) -> Result<bool> {
         validate(key, None)?;
         let inner = &*self.inner;
         inner.check_writable()?;
@@ -896,11 +1285,29 @@ impl Db {
         let inner = &*self.inner;
         let mut keys = 0u64;
         let mut key_bytes = 0u64;
+        // Los contadores de operaciones se suman aquí, en el recorrido de
+        // particiones que `stats` ya hacía: no cuesta ninguna pasada extra.
+        let mut ops = [0u64; 9];
         for s in &inner.shards {
             let m = rd(&s.map);
             keys += m.len() as u64;
             for k in m.keys() {
                 key_bytes += k.len() as u64;
+            }
+            drop(m);
+            let c = &s.ops;
+            for (acc, v) in ops.iter_mut().zip([
+                c.puts.load(Ordering::Relaxed),
+                c.gets.load(Ordering::Relaxed),
+                c.gets_hit.load(Ordering::Relaxed),
+                c.deletes.load(Ordering::Relaxed),
+                c.deletes_hit.load(Ordering::Relaxed),
+                c.errores.load(Ordering::Relaxed),
+                c.bytes_escritos.load(Ordering::Relaxed),
+                c.bytes_leidos.load(Ordering::Relaxed),
+                c.get_reintentos.load(Ordering::Relaxed),
+            ]) {
+                *acc += v;
             }
         }
         let (segments, disk_bytes) = {
@@ -934,22 +1341,277 @@ impl Db {
             fsync: inner.opts.fsync.name().to_string(),
             compacting: inner.compacting.load(Ordering::Relaxed),
             health,
+            estado: self.health().estado.name().to_string(),
             recovery_corrupt_records: inner.recovery.corrupt_records,
             recovery_corrupt_bytes: inner.recovery.corrupt_bytes,
             recovery_truncated_tails: inner.recovery.truncated_tails.len() as u64,
+            ops_put: ops[0],
+            ops_get: ops[1],
+            ops_get_hit: ops[2],
+            ops_delete: ops[3],
+            ops_delete_hit: ops[4],
+            ops_errors: ops[5],
+            bytes_written: ops[6],
+            bytes_read: ops[7],
+            get_retries: ops[8],
+            fsyncs: inner.syncs_hechos.load(Ordering::Relaxed),
+            compactions: inner.ops.compactaciones.load(Ordering::Relaxed),
+            compactions_failed: inner.ops.compactaciones_fallidas.load(Ordering::Relaxed),
+            backups: inner.ops.copias.load(Ordering::Relaxed),
+            backups_failed: inner.ops.copias_fallidas.load(Ordering::Relaxed),
         }
+    }
+
+    /// Estado de salud: qué fallos conocidos hay y de qué gravedad. Ver
+    /// [`Estado`] para lo que esto **no** detecta.
+    ///
+    /// M7 sigue en pie: esto no es una instantánea coherente. Se consultan
+    /// varias fuentes de una en una y una operación puede ocurrir en medio.
+    /// Para un semáforo de operación da igual; para una auditoría, no.
+    pub fn health(&self) -> Salud {
+        let inner = &*self.inner;
+        let mut motivos = Vec::new();
+        let mut estado = Estado::Ok;
+
+        if let Some(m) = &lk(&inner.synced).failed {
+            estado = Estado::Critico;
+            motivos.push(format!(
+                "no-escribible: un fsync falló y el motor no vuelve a aceptar escrituras \
+                 hasta reiniciar ({m})"
+            ));
+        }
+        let rep = &inner.recovery;
+        if rep.corrupt_records > 0 {
+            estado = Estado::Critico;
+            motivos.push(format!(
+                "datos perdidos al recuperar: {} registro(s) ilegibles y {} byte(s) \
+                 saltados al abrir. Esto NO se arregla solo: ver docs/RECUPERACION.md",
+                rep.corrupt_records, rep.corrupt_bytes
+            ));
+        }
+        if !rep.truncated_tails.is_empty() {
+            estado = estado.max(Estado::Aviso);
+            motivos.push(format!(
+                "{} cola(s) de escritura incompleta recortadas al abrir: normal después \
+                 de un apagón o un kill -9, y no se perdió nada confirmado",
+                rep.truncated_tails.len()
+            ));
+        }
+        if !rep.quarantined.is_empty() {
+            estado = estado.max(Estado::Aviso);
+            motivos.push(format!(
+                "{} fichero(s) en cuarentena de una reparación: ocupan disco y hay que \
+                 revisarlos o borrarlos a mano",
+                rep.quarantined.len()
+            ));
+        }
+        // Umbral explícito, no una corazonada: con la auto-compactación
+        // apagada nadie va a recuperar ese espacio por su cuenta.
+        const BASURA_ALTA: f64 = 0.8;
+        let dead = inner.dead.load(Ordering::Relaxed);
+        let live = inner.live.load(Ordering::Relaxed);
+        let prop = dead as f64 / (dead + live).max(1) as f64;
+        if !inner.opts.auto_compact && prop > BASURA_ALTA && dead > (16 << 20) {
+            estado = estado.max(Estado::Aviso);
+            motivos.push(format!(
+                "el {:.0} % de los bytes del log son basura ({dead} bytes) y auto_compact \
+                 está desactivado: hay que llamar a COMPACT o el disco seguirá creciendo",
+                prop * 100.0
+            ));
+        }
+        Salud { estado, motivos }
+    }
+
+    /// Métricas en el formato de exposición de Prometheus.
+    ///
+    /// No hay servidor HTTP: esto devuelve el texto, y quien lo quiera servir
+    /// usa la orden `METRICS` o `bitacora metrics`. En `docs/OPERACION.md` está
+    /// el puente de dos líneas para un recolector.
+    pub fn metricas(&self) -> crate::metricas::Registro {
+        use crate::metricas::Registro;
+        let st = self.stats();
+        let salud = self.health();
+        let mut r = Registro::new();
+        r.gauge("bitacora_up", "1 si el motor está abierto.", 1);
+        r.gauge(
+            "bitacora_health_state",
+            "Salud: 0 = ok, 1 = aviso, 2 = critico.",
+            match salud.estado {
+                Estado::Ok => 0,
+                Estado::Aviso => 1,
+                Estado::Critico => 2,
+            },
+        );
+        r.gauge(
+            "bitacora_writable",
+            "1 si el motor acepta escrituras; 0 si un fsync falló.",
+            u64::from(st.health == "ok"),
+        );
+        r.gauge("bitacora_keys", "Claves vivas en el índice.", st.keys);
+        r.gauge(
+            "bitacora_segments",
+            "Segmentos del log en disco.",
+            st.segments,
+        );
+        r.gauge(
+            "bitacora_disk_bytes",
+            "Bytes que ocupan los segmentos.",
+            st.disk_bytes,
+        );
+        r.gauge(
+            "bitacora_live_bytes",
+            "Bytes de registros vigentes.",
+            st.live_bytes,
+        );
+        r.gauge(
+            "bitacora_dead_bytes",
+            "Bytes de registros sustituidos o borrados, pendientes de compactar.",
+            st.dead_bytes,
+        );
+        r.gauge(
+            "bitacora_index_bytes",
+            "Estimación de la RAM que ocupa el índice.",
+            st.index_bytes_est,
+        );
+        r.gauge(
+            "bitacora_last_seq",
+            "Número de secuencia del último registro escrito.",
+            st.last_seq,
+        );
+        r.gauge(
+            "bitacora_synced_seq",
+            "Número de secuencia garantizado en disco. La diferencia con last_seq es lo que un apagón se llevaría.",
+            st.synced_seq,
+        );
+        r.gauge(
+            "bitacora_compacting",
+            "1 mientras hay una compactación en marcha.",
+            u64::from(st.compacting),
+        );
+        r.gauge(
+            "bitacora_recovery_corrupt_records",
+            "Registros ilegibles saltados en la última apertura. Si no es 0, se perdieron datos.",
+            st.recovery_corrupt_records,
+        );
+        r.gauge(
+            "bitacora_recovery_corrupt_bytes",
+            "Bytes ilegibles saltados en la última apertura.",
+            st.recovery_corrupt_bytes,
+        );
+        r.gauge(
+            "bitacora_recovery_truncated_tails",
+            "Colas de escritura incompleta recortadas en la última apertura.",
+            st.recovery_truncated_tails,
+        );
+        r.familia(
+            "bitacora_ops_total",
+            "Operaciones atendidas por el motor desde que arrancó.",
+            "op",
+            &[
+                ("put", st.ops_put),
+                ("get", st.ops_get),
+                ("delete", st.ops_delete),
+            ],
+        );
+        r.familia(
+            "bitacora_get_results_total",
+            "Resultado de los get: la clave estaba o no estaba.",
+            "result",
+            &[
+                ("hit", st.ops_get_hit),
+                ("miss", st.ops_get.saturating_sub(st.ops_get_hit)),
+            ],
+        );
+        r.contador(
+            "bitacora_errors_total",
+            "Operaciones que devolvieron error.",
+            st.ops_errors,
+        );
+        r.contador(
+            "bitacora_bytes_written_total",
+            "Bytes de registro escritos en el log (cabecera incluida).",
+            st.bytes_written,
+        );
+        r.contador(
+            "bitacora_bytes_read_total",
+            "Bytes de valor devueltos por get.",
+            st.bytes_read,
+        );
+        r.contador(
+            "bitacora_fsync_total",
+            "fsync intentados. Las escrituras por fsync dicen cuánto amortiza el group commit.",
+            st.fsyncs,
+        );
+        r.contador(
+            "bitacora_get_retries_total",
+            "Veces que un get volvió a mirar el índice porque la compactación retiró su segmento.",
+            st.get_retries,
+        );
+        r.familia(
+            "bitacora_compactions_total",
+            "Compactaciones terminadas y abandonadas por error.",
+            "result",
+            &[("ok", st.compactions), ("failed", st.compactions_failed)],
+        );
+        r.familia(
+            "bitacora_backups_total",
+            "Copias de seguridad en caliente terminadas y fallidas.",
+            "result",
+            &[("ok", st.backups), ("failed", st.backups_failed)],
+        );
+        r.contador(
+            "bitacora_log_dropped_total",
+            "Líneas de registro que no se pudieron escribir. Si no es 0, el log está incompleto.",
+            crate::log::descartadas(),
+        );
+        r
     }
 
     /// Reescribe los registros vivos de todos los segmentos cerrados y borra
     /// los viejos. Puede ejecutarse con lecturas y escrituras en marcha.
     pub fn compact(&self) -> Result<CompactReport> {
-        self.inner.compact()
+        let t0 = Instant::now();
+        let r = self.inner.compact();
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        match &r {
+            Ok(rep) if rep.ran && rep.segments_removed > 0 => {
+                mas(&self.inner.ops.compactaciones, 1);
+                crate::log::info(
+                    "compaction_done",
+                    &[
+                        ("segments_removed", rep.segments_removed.into()),
+                        ("bytes_before", rep.bytes_before.into()),
+                        ("bytes_after", rep.bytes_after.into()),
+                        ("ms", ms.into()),
+                    ],
+                );
+            }
+            // `ran` sin segmentos retirados: no había nada que compactar, o
+            // había otra compactación en marcha. No es un evento.
+            Ok(_) => {}
+            Err(e) => {
+                // Solo en su propio contador: `errors_total` cuenta errores de
+                // operación (put/get/delete) y sumar aquí sería contar la
+                // misma compactación fallida dos veces en dos métricas.
+                mas(&self.inner.ops.compactaciones_fallidas, 1);
+                crate::log::error(
+                    "compaction_failed",
+                    &[
+                        ("category", e.categoria().into()),
+                        ("error", e.to_string().into()),
+                        ("ms", ms.into()),
+                    ],
+                );
+            }
+        }
+        r
     }
 
     pub fn close(&self) -> Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        let t0 = Instant::now();
         let inner = &*self.inner;
         inner.stop.store(true, Ordering::Release);
         {
@@ -964,9 +1626,197 @@ impl Db {
             thread::sleep(Duration::from_millis(2));
         }
         let w = lk(&inner.writer);
-        inner.sync_file(&w.file)?;
+        let r = inner.sync_file(&w.file);
+        let st = lk(&inner.synced).seq;
+        // El bloqueo se suelta aquí, con el último fsync ya hecho: así, cuando
+        // `close()` devuelve, otro proceso puede abrir el directorio y va a
+        // encontrar todo lo confirmado en disco.
+        drop(lk(&self.bloqueo).take());
+        match &r {
+            Ok(()) => crate::log::info(
+                "engine_closed",
+                &[
+                    ("synced_seq", st.into()),
+                    ("ms", (t0.elapsed().as_secs_f64() * 1000.0).into()),
+                ],
+            ),
+            Err(e) => crate::log::error(
+                "engine_close_failed",
+                &[("error", e.to_string().into()), ("synced_seq", st.into())],
+            ),
+        }
+        r?;
         Ok(())
     }
+
+    /// Copia en caliente todos los segmentos a `destino`, con el motor en
+    /// marcha y atendiendo lecturas y escrituras.
+    ///
+    /// # Qué garantiza
+    ///
+    /// La copia contiene **exactamente** todos los registros escritos antes del
+    /// instante en que empieza, y ninguno parcial. Restaurarla da la base de
+    /// datos tal como estaba en ese instante. Dos cosas lo consiguen:
+    ///
+    /// 1. La longitud del segmento activo se toma bajo el candado de escritura,
+    ///    y ese contador solo avanza **después** de que un registro se haya
+    ///    escrito entero, así que copiar esos bytes nunca parte un registro.
+    /// 2. Mientras la copia está en marcha se sostiene el candado `retirada`,
+    ///    así que la compactación no puede borrar un segmento a medio copiar.
+    ///    Una compactación en curso **no** se interrumpe: solo espera para
+    ///    retirar los viejos.
+    ///
+    /// # Qué NO garantiza
+    ///
+    /// * **No es un punto de recuperación consistente con otra cosa.** Si la
+    ///   aplicación escribe también en otro sitio, esto no los coordina.
+    /// * **No verifica el destino.** Comprueba que lo copiado tiene el tamaño
+    ///   esperado y hace `fsync`, pero no vuelve a leerlo ni recalcula los CRC;
+    ///   para eso está `bitacora verificar` sobre la copia.
+    /// * **No comprime ni es incremental.** Copia bytes; una copia de 30 GB
+    ///   mueve 30 GB. Para incremental, los segmentos cerrados no cambian
+    ///   nunca: `rsync` sobre el directorio aprovecha eso, pero solo entre
+    ///   compactaciones.
+    /// * **Retrasa la compactación** mientras dura.
+    pub fn backup(&self, destino: impl AsRef<Path>) -> Result<BackupReport> {
+        let r = self.backup_interno(destino.as_ref());
+        match &r {
+            Ok(rep) => {
+                mas(&self.inner.ops.copias, 1);
+                crate::log::info(
+                    "backup_done",
+                    &[
+                        ("dest", crate::log::ruta(destino.as_ref())),
+                        ("segments", rep.segments.into()),
+                        ("bytes", rep.bytes.into()),
+                        ("last_seq", rep.last_seq.into()),
+                        ("ms", rep.ms.into()),
+                    ],
+                );
+            }
+            Err(e) => {
+                mas(&self.inner.ops.copias_fallidas, 1);
+                crate::log::error(
+                    "backup_failed",
+                    &[
+                        ("dest", crate::log::ruta(destino.as_ref())),
+                        ("category", e.categoria().into()),
+                        ("error", e.to_string().into()),
+                    ],
+                );
+            }
+        }
+        r
+    }
+
+    fn backup_interno(&self, destino: &Path) -> Result<BackupReport> {
+        let inner = &*self.inner;
+        let t0 = Instant::now();
+        if destino == inner.opts.dir.as_path() {
+            return Err(Error::Invalida(
+                "el destino de la copia no puede ser el propio directorio de datos",
+            ));
+        }
+        fs::create_dir_all(destino)?;
+        // Negarse a escribir sobre una copia que ya existe: mezclar segmentos
+        // de dos momentos distintos puede resucitar una clave borrada, porque
+        // el estado se reconstruye por `seq` y un segmento viejo traería
+        // registros que el nuevo ya no tiene.
+        for entrada in fs::read_dir(destino)? {
+            let nombre = entrada?.file_name();
+            if nombre.to_string_lossy().ends_with(".log") {
+                return Err(Error::Invalida(
+                    "el destino ya tiene segmentos .log: usa un directorio vacío. \
+                     Mezclar segmentos de dos copias distintas puede resucitar claves borradas",
+                ));
+            }
+        }
+
+        // Candado de retirada ANTES que los demás (ver `Inner::retirada`).
+        let _sin_retiradas = lk(&inner.retirada);
+        // Instantánea: qué segmentos hay y hasta qué byte vale cada uno. El
+        // activo se corta en `w.len`, que es frontera de registro.
+        // Los tres datos bajo el MISMO candado: con dos tomas distintas,
+        // `last_seq` podría incluir un registro escrito después del corte y la
+        // copia prometería algo que no contiene.
+        let (activo, activo_len, last_seq) = {
+            let w = lk(&inner.writer);
+            (w.id, w.len, w.next_seq - 1)
+        };
+        let ids: Vec<u32> = {
+            let segs = rd(&inner.segments);
+            let mut v: Vec<u32> = segs.keys().copied().collect();
+            v.sort_unstable();
+            v
+        };
+
+        let mut bytes = 0u64;
+        let mut copiados = 0u64;
+        for id in &ids {
+            let origen = seg_path(&inner.opts.dir, *id);
+            let f = match File::open(&origen) {
+                Ok(f) => f,
+                // Un segmento puede haber desaparecido entre la instantánea y
+                // aquí solo si algo externo lo borró: el candado impide que lo
+                // haga la compactación. No se calla.
+                Err(e) => {
+                    return Err(Error::Interno(format!(
+                        "el segmento {} desapareció durante la copia: {e}",
+                        origen.display()
+                    )))
+                }
+            };
+            let en_disco = f.metadata()?.len();
+            let tope = if *id == activo {
+                activo_len.min(en_disco)
+            } else {
+                en_disco
+            };
+            if tope == 0 {
+                continue; // segmento activo recién abierto: no aporta nada
+            }
+            let salida = seg_path(destino, *id);
+            let mut dst = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&salida)?;
+            let escritos = copia_exacta(&f, &mut dst, tope)?;
+            if escritos != tope {
+                return Err(Error::Interno(format!(
+                    "la copia de {} quedó en {escritos} de {tope} bytes",
+                    origen.display()
+                )));
+            }
+            // Cada fichero, durable antes de seguir.
+            dst.sync_all()?;
+            bytes += tope;
+            copiados += 1;
+        }
+        // Y los nombres nuevos tampoco son durables sin esto (C3).
+        sync_dir(destino)?;
+        Ok(BackupReport {
+            segments: copiados,
+            bytes,
+            last_seq,
+            ms: t0.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+}
+
+/// Copia exactamente `tope` bytes desde el principio de `origen`.
+fn copia_exacta(origen: &File, destino: &mut File, tope: u64) -> io::Result<u64> {
+    let mut buf = vec![0u8; 1 << 16];
+    let mut pos = 0u64;
+    while pos < tope {
+        let pedir = ((tope - pos) as usize).min(buf.len());
+        let n = origen.read_at(&mut buf[..pedir], pos)?;
+        if n == 0 {
+            break; // el fichero es más corto de lo que decía: se informa arriba
+        }
+        destino.write_all(&buf[..n])?;
+        pos += n as u64;
+    }
+    Ok(pos)
 }
 
 impl Drop for Db {
@@ -982,8 +1832,11 @@ impl Inner {
     }
 
     fn sync_file(&self, f: &File) -> io::Result<()> {
+        // Se cuenta siempre, no solo con inyección de fallos: es la métrica que
+        // dice cuánto está amortizando el group commit (escrituras / fsync).
+        let previos = self.syncs_hechos.fetch_add(1, Ordering::Relaxed);
         if let Some(n) = self.opts.fsync_falla_tras {
-            if self.syncs_hechos.fetch_add(1, Ordering::Relaxed) >= n {
+            if previos >= n {
                 return Err(io::Error::other(
                     "fallo de E/S inyectado en fsync (solo pruebas)",
                 ));
@@ -1029,7 +1882,16 @@ impl Inner {
         let mut g = lk(&self.synced);
         if g.failed.is_none() {
             g.failed = Some(e.to_string());
-            eprintln!("bitacora: FALLO DE DURABILIDAD, no se vuelve a escribir: {e}");
+            crate::log::error(
+                "fsync_failed",
+                &[
+                    ("error", e.to_string().into()),
+                    (
+                        "note",
+                        "la base de datos deja de aceptar escrituras hasta reiniciar".into(),
+                    ),
+                ],
+            );
         }
         self.synced_cv.notify_all();
     }
@@ -1100,7 +1962,13 @@ impl Inner {
             .name("bitacora-compact".into())
             .spawn(move || {
                 if let Err(e) = me.compact() {
-                    eprintln!("bitacora: la compactación falló: {e}");
+                    crate::log::error(
+                        "auto_compaction_failed",
+                        &[
+                            ("category", e.categoria().into()),
+                            ("error", e.to_string().into()),
+                        ],
+                    );
                 }
             });
     }
@@ -1238,6 +2106,13 @@ impl Inner {
 
         // Retirar los segmentos viejos: primero del mapa (los lectores que ya
         // tenían el descriptor siguen leyendo sin problema), luego del disco.
+        //
+        // El candado de retirada se toma ANTES que `segments` (ver
+        // `Inner::retirada`): si hay una copia de seguridad en marcha, se
+        // espera a que acabe en vez de borrarle un segmento a medio copiar.
+        // Todo lo copiado hasta aquí ya está en disco y sincronizado, así que
+        // esperar no deshace trabajo.
+        let _sin_copias = lk(&self.retirada);
         {
             let mut segs = wr(&self.segments);
             for id in &old_ids {

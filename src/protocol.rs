@@ -8,6 +8,9 @@
 //! EXISTS clave         -> INT 1 | INT 0
 //! KEYS [prefijo]       -> KEYS <n>  seguido de n líneas
 //! STATS                -> STATS <n> seguido de n líneas "nombre valor"
+//! HEALTH               -> HEALTH <ok|aviso|critico> <n> seguido de n motivos
+//! METRICS              -> METRICS <n> seguido de n líneas (Prometheus)
+//! BACKUP [nombre]      -> OK <ruta> segmentos=.. bytes=.. | ERR
 //! COMPACT              -> OK ...
 //! PING                 -> PONG
 //! QUIT                 -> BYE
@@ -33,6 +36,14 @@ pub enum Command<'a> {
         limite: Option<usize>,
     },
     Stats,
+    /// Semáforo de operación: `ok`, `aviso` o `critico`, con los motivos.
+    Health,
+    /// Métricas en el formato de exposición de Prometheus.
+    Metrics,
+    /// `BACKUP [nombre]`: copia en caliente dentro del directorio de copias
+    /// que se configuró al arrancar. El nombre es **un solo componente de
+    /// ruta**, nunca una ruta: el cliente no elige dónde escribe el servidor.
+    Backup(Option<&'a [u8]>),
     Compact,
     Ping,
     Quit,
@@ -94,6 +105,19 @@ pub fn parse(line: &[u8]) -> Result<Command<'_>, &'static str> {
             Ok(Command::Keys { prefix, limite })
         }
         b"STATS" | b"INFO" => Ok(Command::Stats),
+        b"HEALTH" => Ok(Command::Health),
+        b"METRICS" => Ok(Command::Metrics),
+        b"BACKUP" => {
+            let (nombre, more) = split_word(rest);
+            if !more.is_empty() {
+                return Err("uso: BACKUP [nombre] (un nombre, sin espacios ni rutas)");
+            }
+            Ok(Command::Backup(if nombre.is_empty() {
+                None
+            } else {
+                Some(nombre)
+            }))
+        }
         b"COMPACT" => Ok(Command::Compact),
         b"AUTH" => {
             let (clave, _) = split_word(rest);
@@ -106,7 +130,9 @@ pub fn parse(line: &[u8]) -> Result<Command<'_>, &'static str> {
         b"PING" => Ok(Command::Ping),
         b"QUIT" | b"EXIT" => Ok(Command::Quit),
         b"" => Err("línea vacía"),
-        _ => Err("comando desconocido (AUTH SET GET DEL EXISTS KEYS STATS COMPACT PING QUIT)"),
+        _ => Err(
+            "comando desconocido (AUTH SET GET DEL EXISTS KEYS STATS HEALTH METRICS COMPACT PING QUIT)",
+        ),
     }
 }
 
@@ -166,5 +192,16 @@ mod tests {
         );
         assert_eq!(parse(b"AUTH secreto").unwrap(), Command::Auth(b"secreto"));
         assert!(parse(b"AUTH").is_err(), "AUTH sin clave es un error");
+        assert_eq!(parse(b"health\n").unwrap(), Command::Health);
+        assert_eq!(parse(b"METRICS").unwrap(), Command::Metrics);
+        assert_eq!(parse(b"BACKUP").unwrap(), Command::Backup(None));
+        assert_eq!(
+            parse(b"BACKUP noche").unwrap(),
+            Command::Backup(Some(b"noche"))
+        );
+        assert!(
+            parse(b"BACKUP a b").is_err(),
+            "un nombre con espacios no se acepta: no es una ruta"
+        );
     }
 }
