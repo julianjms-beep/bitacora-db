@@ -89,6 +89,39 @@ pub struct ServerConfig {
     pub backup_dir: Option<std::path::PathBuf>,
 }
 
+/// Estado de una conexión.
+///
+/// Antes era un `bool` suelto («¿ya se autenticó?»). Con `USE` hay dos cosas
+/// por conexión, y pasarlas como dos referencias mutables sueltas era pedir que
+/// alguien las descolocara.
+pub struct Sesion {
+    pub autenticado: bool,
+    /// Prefijo que `USE` pone delante de cada clave de esta conexión, con su
+    /// separador. Vacío = sin namespace.
+    pub prefijo: Vec<u8>,
+}
+
+impl Sesion {
+    pub fn nueva(cfg: &ServerConfig) -> Sesion {
+        Sesion {
+            // M5: sin clave configurada, todo el mundo entra.
+            autenticado: cfg.clave.is_none(),
+            prefijo: Vec::new(),
+        }
+    }
+
+    /// La clave real, con el prefijo del `USE` si hay.
+    fn clave(&self, key: &[u8]) -> Vec<u8> {
+        if self.prefijo.is_empty() {
+            return key.to_vec();
+        }
+        let mut k = Vec::with_capacity(self.prefijo.len() + key.len());
+        k.extend_from_slice(&self.prefijo);
+        k.extend_from_slice(key);
+        k
+    }
+}
+
 /// Comprueba que `nombre` es **un solo componente de ruta** inofensivo.
 ///
 /// Rechaza barras, `..`, nombres ocultos y cualquier cosa que no sea
@@ -454,8 +487,7 @@ pub fn handle(db: &Db, stream: TcpStream, cfg: &ServerConfig) -> io::Result<()> 
     let mut rd = BufReader::new(stream.try_clone()?);
     let mut wr = BufWriter::new(stream);
     let mut line = Vec::with_capacity(512);
-    // M5: sin clave configurada, todo el mundo entra.
-    let mut autenticado = cfg.clave.is_none();
+    let mut ses = Sesion::nueva(cfg);
     loop {
         if PARAR.load(Ordering::SeqCst) || cfg.parada.load(Ordering::SeqCst) {
             let _ = wr.write_all(b"ERR interno el servidor se esta parando\n");
@@ -473,7 +505,7 @@ pub fn handle(db: &Db, stream: TcpStream, cfg: &ServerConfig) -> io::Result<()> 
             continue;
         }
         let quit = match parse(&line) {
-            Ok(cmd) => execute(db, cmd, &mut wr, cfg, &mut autenticado)?,
+            Ok(cmd) => execute(db, cmd, &mut wr, cfg, &mut ses)?,
             Err(e) => {
                 cfg.metricas.ordenes.fetch_add(1, Ordering::Relaxed);
                 cfg.metricas
@@ -496,7 +528,7 @@ pub fn execute<W: Write>(
     cmd: Command<'_>,
     out: &mut W,
     cfg: &ServerConfig,
-    autenticado: &mut bool,
+    ses: &mut Sesion,
 ) -> io::Result<bool> {
     cfg.metricas.ordenes.fetch_add(1, Ordering::Relaxed);
     // M5: antes de autenticarse solo se puede saludar, autenticarse y salir.
@@ -504,7 +536,7 @@ pub fn execute<W: Write>(
     // `HEALTH` y `METRICS` **no** están entre las excepciones a propósito: el
     // estado interno y los contadores de un servidor no son información
     // pública. Para un `healthcheck` con clave, `bitacora health --clave`.
-    if !*autenticado && !matches!(cmd, Command::Auth(_) | Command::Ping | Command::Quit) {
+    if !ses.autenticado && !matches!(cmd, Command::Auth(_) | Command::Ping | Command::Quit) {
         cfg.metricas
             .ordenes_invalidas
             .fetch_add(1, Ordering::Relaxed);
@@ -516,10 +548,10 @@ pub fn execute<W: Write>(
             None => out.write_all(b"OK no hay autenticacion configurada\n")?,
             Some(esperada) => {
                 if igual_en_tiempo_constante(clave, esperada.as_bytes()) {
-                    *autenticado = true;
+                    ses.autenticado = true;
                     out.write_all(b"OK\n")?;
                 } else {
-                    *autenticado = false;
+                    ses.autenticado = false;
                     cfg.metricas.auth_fallidas.fetch_add(1, Ordering::Relaxed);
                     // Sin dirección de origen: con un hilo por conexión, quien
                     // quiera correlacionar tiene el registro del sistema. Y la
@@ -538,13 +570,13 @@ pub fn execute<W: Write>(
                     b"ERR invalida el valor no puede contener saltos de linea en este protocolo\n",
                 )?;
             } else {
-                match db.put(key, value) {
+                match db.put(&ses.clave(key), value) {
                     Ok(()) => out.write_all(b"OK\n")?,
                     Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
                 }
             }
         }
-        Command::Get(k) => match db.get(k) {
+        Command::Get(k) => match db.get(&ses.clave(k)) {
             Ok(Some(v)) => {
                 // M4: no reservar ni enviar respuestas enormes por el socket.
                 if v.len() > cfg.max_value_bytes {
@@ -568,23 +600,27 @@ pub fn execute<W: Write>(
             Ok(None) => out.write_all(b"NIL\n")?,
             Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
         },
-        Command::Del(k) => match db.delete(k) {
+        Command::Del(k) => match db.delete(&ses.clave(k)) {
             Ok(true) => out.write_all(b"OK\n")?,
             Ok(false) => out.write_all(b"NIL\n")?,
             Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
         },
-        Command::Exists(k) => writeln!(out, "INT {}", db.exists(k) as u8)?,
+        Command::Exists(k) => writeln!(out, "INT {}", db.exists(&ses.clave(k)) as u8)?,
         Command::Keys { prefix, limite } => {
             // A3: el límite del cliente nunca puede superar el del servidor.
             let lim = limite.unwrap_or(cfg.keys_limit).min(cfg.keys_limit);
-            let (ks, hay_mas) = db.keys(prefix, lim);
+            // Con `USE`, se busca con el prefijo puesto y se quita de la
+            // respuesta: el cliente no tiene por qué ver el prefijo que no
+            // escribió.
+            let (ks, hay_mas) = db.keys(&ses.clave(prefix), lim);
+            let recorte = ses.prefijo.len();
             if hay_mas {
                 writeln!(out, "KEYS {} truncado", ks.len())?;
             } else {
                 writeln!(out, "KEYS {}", ks.len())?;
             }
             for k in ks {
-                out.write_all(&k)?;
+                out.write_all(&k[recorte..])?;
                 out.write_all(b"\n")?;
             }
         }
@@ -646,6 +682,99 @@ pub fn execute<W: Write>(
                             Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
                         }
                     }
+                }
+            }
+        },
+        Command::SetEx {
+            key,
+            segundos,
+            value,
+        } => {
+            if value.contains(&b'\n') || value.contains(&b'\r') {
+                out.write_all(
+                    b"ERR invalida el valor no puede contener saltos de linea en este protocolo\n",
+                )?;
+            } else {
+                match db.put_ttl(&ses.clave(key), value, Duration::from_secs(segundos)) {
+                    Ok(()) => out.write_all(b"OK\n")?,
+                    Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
+                }
+            }
+        }
+        Command::Ttl(k) => match db.ttl(&ses.clave(k)) {
+            None => out.write_all(b"NIL\n")?,
+            Some(None) => out.write_all(b"INT -1\n")?,
+            // Se redondea hacia arriba: a una clave a la que le quedan 300 ms
+            // le queda «1 segundo», no «0». Un 0 significaría que ya no está,
+            // y sí está.
+            Some(Some(d)) => writeln!(out, "INT {}", d.as_millis().div_ceil(1000))?,
+        },
+        Command::GetSeq(k) => match db.get_seq(&ses.clave(k)) {
+            Ok(Some((seq, v))) => {
+                if v.len() > cfg.max_value_bytes {
+                    writeln!(
+                        out,
+                        "ERR invalida el valor ocupa {} bytes y el maximo por este protocolo es {}; usa la API de Rust",
+                        v.len(),
+                        cfg.max_value_bytes
+                    )?;
+                } else if v.contains(&b'\n') || v.contains(&b'\r') {
+                    out.write_all(
+                        b"ERR interno el valor contiene saltos de linea y no se puede enviar por este protocolo\n",
+                    )?;
+                } else {
+                    write!(out, "VALSEQ {seq} ")?;
+                    out.write_all(&v)?;
+                    out.write_all(b"\n")?;
+                }
+            }
+            Ok(None) => out.write_all(b"NIL\n")?,
+            Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
+        },
+        Command::Cas { key, seq, value } => {
+            if value.contains(&b'\n') || value.contains(&b'\r') {
+                out.write_all(
+                    b"ERR invalida el valor no puede contener saltos de linea en este protocolo\n",
+                )?;
+            } else {
+                let real = ses.clave(key);
+                // `seq = 0` es «no debe existir»: el primer seq que reparte el
+                // motor es 1, así que 0 no puede ser el de ninguna clave.
+                let esperado = if seq == 0 { None } else { Some(seq) };
+                match db.compare_and_swap_seq(&real, esperado, Some(value)) {
+                    Ok(true) => out.write_all(b"OK\n")?,
+                    // Se devuelve el seq actual para que el cliente pueda
+                    // reintentar sin otra consulta.
+                    Ok(false) => writeln!(out, "NO {}", db.seq(&real).unwrap_or(0))?,
+                    Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
+                }
+            }
+        }
+        Command::CasDel { key, seq } => {
+            let real = ses.clave(key);
+            let esperado = if seq == 0 { None } else { Some(seq) };
+            match db.compare_and_swap_seq(&real, esperado, None) {
+                Ok(true) => out.write_all(b"OK\n")?,
+                Ok(false) => writeln!(out, "NO {}", db.seq(&real).unwrap_or(0))?,
+                Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
+            }
+        }
+        Command::Use(ns) => match ns {
+            None => {
+                ses.prefijo.clear();
+                out.write_all(b"OK\n")?;
+            }
+            Some(n) => {
+                // Se valida con el motor, que es quien decide qué nombre vale,
+                // en vez de repetir aquí la regla y que se separen.
+                match db.namespace(n) {
+                    Ok(ns) => {
+                        ses.prefijo = ns.prefijo().to_vec();
+                        out.write_all(b"OK ")?;
+                        out.write_all(&ses.prefijo)?;
+                        out.write_all(b"\n")?;
+                    }
+                    Err(e) => writeln!(out, "ERR {} {e}", e.categoria())?,
                 }
             }
         },

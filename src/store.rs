@@ -293,18 +293,57 @@ struct SyncState {
     failed: Option<String>,
 }
 
-/// Dónde está el valor de una clave. 24 bytes.
+/// Dónde está el valor de una clave. 32 bytes.
+///
+/// `caduca` ocupa 8 de esos bytes y los paga **toda** clave, también las que no
+/// usan TTL: el índice pasa de 24 a 32 bytes por entrada. Está medido en
+/// `docs/RENDIMIENTO.md`. La alternativa era guardar solo un bit en los bits
+/// libres de `vlen` y leer la caducidad del disco, y se descartó porque
+/// convertiría `exists()`, `len()` y `KEYS` en operaciones de entrada/salida.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Loc {
     file_id: u32,
     vlen: u32,
     vpos: u64,
     seq: u64,
+    /// Milisegundos desde la época en que la clave deja de ser visible, o **0
+    /// si no caduca**.
+    caduca: u64,
+}
+
+impl Loc {
+    /// `true` si la clave sigue siendo visible.
+    ///
+    /// Es una comparación con el reloj de pared, y eso tiene consecuencias que
+    /// no se pueden esconder: si el reloj del sistema salta hacia atrás, las
+    /// claves viven más de lo pedido; si salta hacia delante, caducan antes.
+    /// No hay alternativa: un TTL es una promesa sobre el tiempo real, y un
+    /// reloj monótono no sobrevive a un reinicio.
+    #[inline]
+    fn vigente(&self, ahora: u64) -> bool {
+        self.caduca == 0 || self.caduca > ahora
+    }
+}
+
+/// Milisegundos desde la época. Si el reloj dice algo anterior a 1970 devuelve
+/// 0, con lo que **nada caduca**: ante un reloj imposible, no borrar.
+fn ahora_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[inline]
 fn rec_len(klen: usize, vlen: u32) -> u64 {
-    (HEADER + klen) as u64 + vlen as u64
+    rec_len_con(klen, vlen, false)
+}
+
+/// Bytes que ocupa un registro en disco. Un registro con caducidad ocupa 8
+/// bytes más, y olvidarlo descuadraría la contabilidad de bytes vivos y
+/// muertos, que es la que decide cuándo compactar.
+#[inline]
+fn rec_len_con(klen: usize, vlen: u32, con_caduca: bool) -> u64 {
+    (HEADER + klen) as u64 + vlen as u64 + if con_caduca { wal::TTL_BYTES as u64 } else { 0 }
 }
 
 fn fnv1a(key: &[u8]) -> u64 {
@@ -429,6 +468,18 @@ struct Inner {
     retirada: Mutex<()>,
     /// Contadores de observabilidad.
     ops: Contadores,
+    /// ¿Hay (o ha habido) alguna clave con caducidad desde que se abrió?
+    ///
+    /// Es **conservador a propósito**: se pone a `true` al escribir el primer
+    /// TTL y no se vuelve a bajar, porque saberlo con exactitud exigiría
+    /// contabilizarlo en cada escritura, borrado y compactación, y un contador
+    /// así mal llevado es peor que no tenerlo. Al reabrir se recalcula de los
+    /// datos: si no quedó ninguna clave con caducidad, vuelve a `false`.
+    ///
+    /// Lo único que decide es si `len()` puede usar el camino rápido
+    /// (`HashMap::len`, O(particiones)) o tiene que contar saltándose las
+    /// caducadas (O(claves)).
+    hay_ttl: AtomicBool,
     /// Qué pasó al reconstruir el índice al abrir.
     recovery: RecoveryReport,
 }
@@ -565,6 +616,126 @@ pub struct Salud {
     pub motivos: Vec<String>,
 }
 
+/// Separador entre el nombre del namespace y la clave.
+pub const NS_SEP: u8 = b':';
+
+/// Vista de la base de datos con un prefijo delante de cada clave.
+///
+/// # Lo que NO es
+///
+/// Esto es una **convención de nombres con ayudas**, y conviene no confundirlo
+/// con lo que la palabra «namespace» promete en otros sistemas:
+///
+/// * **No hay aislamiento.** Quien use la API o el protocolo sin namespace ve
+///   todas las claves de todos ellos. El prefijo no es una frontera de
+///   seguridad: la autenticación es una sola para todo el servidor.
+/// * **No hay cuotas ni contabilidad separadas.** `STATS` y las métricas
+///   cuentan el total; no hay bytes ni claves por namespace.
+/// * **No hay creación ni borrado.** Un namespace existe porque alguien
+///   escribió una clave con ese prefijo, y desaparece cuando se borra la
+///   última. No hay `DROP`.
+/// * **No cambia nada en el motor.** Ni el formato, ni el índice, ni la
+///   recuperación. Por eso cabe en este gate: es composición, no estructura.
+///
+/// Lo que sí da: no tener que pegar el prefijo a mano en cada llamada —que es
+/// donde aparecen los errores—, que `keys` lo quite de los resultados, y un
+/// sitio donde está escrito qué separador se usa.
+pub struct Namespace<'a> {
+    db: &'a Db,
+    prefijo: Vec<u8>,
+}
+
+impl<'a> Namespace<'a> {
+    fn clave(&self, key: &[u8]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(self.prefijo.len() + key.len());
+        k.extend_from_slice(&self.prefijo);
+        k.extend_from_slice(key);
+        k
+    }
+
+    /// El prefijo que se pone delante de cada clave, separador incluido.
+    pub fn prefijo(&self) -> &[u8] {
+        &self.prefijo
+    }
+
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.db.put(&self.clave(key), value)
+    }
+
+    pub fn put_ttl(&self, key: &[u8], value: &[u8], ttl: Duration) -> Result<()> {
+        self.db.put_ttl(&self.clave(key), value, ttl)
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.db.get(&self.clave(key))
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        self.db.delete(&self.clave(key))
+    }
+
+    pub fn exists(&self, key: &[u8]) -> bool {
+        self.db.exists(&self.clave(key))
+    }
+
+    pub fn ttl(&self, key: &[u8]) -> Option<Option<Duration>> {
+        self.db.ttl(&self.clave(key))
+    }
+
+    pub fn compare_and_swap(
+        &self,
+        key: &[u8],
+        esperado: Option<&[u8]>,
+        nuevo: Option<&[u8]>,
+    ) -> Result<bool> {
+        self.db.compare_and_swap(&self.clave(key), esperado, nuevo)
+    }
+
+    /// Las claves del namespace, **sin** el prefijo.
+    pub fn keys(&self, prefix: &[u8], limite: usize) -> (Vec<Vec<u8>>, bool) {
+        let mut buscar = self.prefijo.clone();
+        buscar.extend_from_slice(prefix);
+        let (ks, mas) = self.db.keys(&buscar, limite);
+        let n = self.prefijo.len();
+        (ks.into_iter().map(|k| k[n..].to_vec()).collect(), mas)
+    }
+
+    /// Claves vivas del namespace. Es O(claves de **toda** la base, no solo
+    /// del namespace): el índice no está agrupado por prefijo.
+    pub fn len(&self) -> usize {
+        self.keys(b"", usize::MAX).0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Una operación de un lote ([`Db::write_batch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op<'a> {
+    Put {
+        key: &'a [u8],
+        value: &'a [u8],
+    },
+    PutTtl {
+        key: &'a [u8],
+        value: &'a [u8],
+        ttl: Duration,
+    },
+    Delete {
+        key: &'a [u8],
+    },
+}
+
+impl<'a> Op<'a> {
+    pub fn key(&self) -> &'a [u8] {
+        match self {
+            Op::Put { key, .. } | Op::PutTtl { key, .. } | Op::Delete { key } => key,
+        }
+    }
+}
+
 /// Resultado de una copia de seguridad en caliente ([`Db::backup`]).
 #[derive(Clone, Debug, Default)]
 pub struct BackupReport {
@@ -582,6 +753,9 @@ pub struct CompactReport {
     pub segments_removed: usize,
     pub bytes_before: u64,
     pub bytes_after: u64,
+    /// Claves caducadas que esta compactación retiró del índice. Es lo único
+    /// que recupera de verdad la RAM de una clave con TTL.
+    pub expired_removed: u64,
 }
 
 /// Fichero de bloqueo del directorio. No acaba en `.log`, así que ni la
@@ -664,6 +838,19 @@ fn validate(key: &[u8], value: Option<&[u8]>) -> Result<()> {
         if v.len() > MAX_VALUE {
             return Err(Error::Invalida("valor de más de 1 GiB"));
         }
+    }
+    Ok(())
+}
+
+/// Como `validate`, pero un registro con caducidad admite 8 bytes menos de
+/// valor: la caducidad va en la misma carga y `val_len` sigue siendo un `u32`.
+/// Es una asimetría real y se rechaza antes de escribir, no al leer.
+fn validate_con_ttl(key: &[u8], value: &[u8], con_caduca: bool) -> Result<()> {
+    validate(key, Some(value))?;
+    if con_caduca && value.len() > wal::MAX_VALUE_TTL {
+        return Err(Error::Invalida(
+            "con caducidad, el valor admite 8 bytes menos (1 GiB - 8): la fecha va en la misma carga",
+        ));
     }
     Ok(())
 }
@@ -786,6 +973,13 @@ impl Db {
         // estricto no se modifica ni un byte de los datos del usuario.
         let mut pending_truncate: Vec<(PathBuf, Arc<File>, u64)> = Vec::new();
         let mut corruptos_en: Vec<u32> = Vec::new();
+        // Un solo instante para toda la reconstrucción: si se leyera el reloj
+        // por registro, dos registros de la misma clave podrían juzgarse con
+        // relojes distintos.
+        let ahora = ahora_ms();
+        // ¿Ha sobrevivido alguna clave con caducidad? Si no, `len()` puede
+        // seguir siendo O(particiones) en vez de O(claves).
+        let mut hay_ttl = false;
 
         for &id in &ids {
             let path = seg_path(&opts.dir, id);
@@ -832,16 +1026,26 @@ impl Db {
                         if r.seq >= next_seq {
                             next_seq = r.seq + 1;
                         }
-                        let vlen = if r.kind == Kind::Put {
-                            r.value.len() as u32
-                        } else {
+                        // Un registro con caducidad ya vencida se trata igual
+                        // que una lápida, y esto NO es un detalle: si se
+                        // ignorara sin más, un `put_ttl` caducado dejaría
+                        // ganar al `put` anterior de la misma clave y el valor
+                        // viejo **resucitaría** al reiniciar.
+                        let caducado = r.caduca != 0 && r.caduca <= ahora;
+                        if r.caduca != 0 && !caducado {
+                            hay_ttl = true;
+                        }
+                        let vlen = if r.kind == Kind::Del || caducado {
                             TOMB
+                        } else {
+                            r.value.len() as u32
                         };
                         let loc = Loc {
                             file_id: id,
                             vlen,
                             vpos: r.vpos,
                             seq: r.seq,
+                            caduca: r.caduca,
                         };
                         let sh = &shards[(fnv1a(&r.key) as usize) % nsh];
                         let mut m = wr(&sh.map);
@@ -928,13 +1132,14 @@ impl Db {
             file.sync_all()?;
         }
 
-        // Las lápidas ya han hecho su trabajo: fuera del índice.
+        // Las lápidas ya han hecho su trabajo: fuera del índice. Y con ellas
+        // las claves cuya caducidad ya venció, que arriba quedaron marcadas.
         let mut live = 0u64;
         for s in &shards {
             let mut m = wr(&s.map);
             m.retain(|_, l| l.vlen != TOMB);
             for (k, l) in m.iter() {
-                live += rec_len(k.len(), l.vlen);
+                live += rec_len_con(k.len(), l.vlen, l.caduca != 0);
             }
             m.shrink_to_fit();
         }
@@ -980,6 +1185,7 @@ impl Db {
             dead: AtomicU64::new(total.saturating_sub(live)),
             retirada: Mutex::new(()),
             ops: Contadores::default(),
+            hay_ttl: AtomicBool::new(hay_ttl),
             recovery: report,
         });
 
@@ -1027,26 +1233,63 @@ impl Db {
     /// Es un envoltorio sobre `put_interno` que solo cuenta: así el camino
     /// caliente queda intacto y los contadores no se cuelan entre los candados.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let r = self.put_interno(key, value);
+        self.put_contado(key, value, 0)
+    }
+
+    /// Escribe una clave que deja de ser visible pasado `ttl`.
+    ///
+    /// # Lo que es y lo que no
+    ///
+    /// * **Es durable**: la caducidad va dentro del registro, así que sobrevive
+    ///   a un reinicio. Al reabrir, una clave vencida no reaparece, y tampoco
+    ///   reaparece el valor que tuviera esa clave **antes** del `put_ttl`.
+    /// * **Es perezosa**: nadie recorre el índice borrando lo vencido. Una
+    ///   clave caducada deja de verse al instante, pero sus bytes siguen en el
+    ///   disco hasta la siguiente compactación, que es la que los retira de
+    ///   verdad (y libera su sitio en el índice).
+    /// * **Depende del reloj de pared.** Ver [`Loc::vigente`].
+    /// * **Un `put` normal sobre la misma clave quita la caducidad**, porque
+    ///   escribe un registro sin ella. Eso es lo que se espera y está probado.
+    pub fn put_ttl(&self, key: &[u8], value: &[u8], ttl: Duration) -> Result<()> {
+        if ttl.is_zero() {
+            return Err(Error::Invalida(
+                "un TTL de 0 no es una escritura con caducidad, es un borrado: usa delete",
+            ));
+        }
+        let ms = ttl.as_millis().min(u128::from(u64::MAX)) as u64;
+        let caduca = ahora_ms().saturating_add(ms).max(1);
+        self.put_contado(key, value, caduca)
+    }
+
+    /// El envoltorio que cuenta, común a `put` y `put_ttl`: así el camino
+    /// caliente queda intacto y los contadores no se cuelan entre los candados.
+    fn put_contado(&self, key: &[u8], value: &[u8], caduca: u64) -> Result<()> {
+        let r = self.put_interno(key, value, caduca);
         let c = &self.inner.shard(key).ops;
         match &r {
             Ok(()) => {
                 mas(&c.puts, 1);
-                mas(&c.bytes_escritos, rec_len(key.len(), value.len() as u32));
+                mas(
+                    &c.bytes_escritos,
+                    rec_len_con(key.len(), value.len() as u32, caduca != 0),
+                );
             }
             Err(_) => mas(&c.errores, 1),
         }
         r
     }
 
-    fn put_interno(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        validate(key, Some(value))?;
+    fn put_interno(&self, key: &[u8], value: &[u8], caduca: u64) -> Result<()> {
+        validate_con_ttl(key, value, caduca != 0)?;
         let inner = &*self.inner;
         inner.check_writable()?;
+        if caduca != 0 {
+            inner.hay_ttl.store(true, Ordering::Relaxed);
+        }
         let seq;
         {
             let mut w = lk(&inner.writer);
-            let rlen = rec_len(key.len(), value.len() as u32);
+            let rlen = rec_len_con(key.len(), value.len() as u32, caduca != 0);
             if w.len > 0 && w.len + rlen > inner.opts.max_segment_bytes {
                 self.inner.roll(&mut w)?;
             }
@@ -1055,7 +1298,11 @@ impl Db {
             {
                 let Writer { file, buf, .. } = &mut *w;
                 buf.clear();
-                wal::encode(buf, seq, Kind::Put, key, value);
+                if caduca == 0 {
+                    wal::encode(buf, seq, Kind::Put, key, value);
+                } else {
+                    wal::encode_ttl(buf, seq, key, value, caduca);
+                }
                 let mut f: &File = file;
                 if let Err(e) = f.write_all(buf) {
                     // Escritura a medias. Hay que deshacerla, porque dejar un
@@ -1083,13 +1330,22 @@ impl Db {
             let loc = Loc {
                 file_id: w.id,
                 vlen: value.len() as u32,
-                vpos: start + (HEADER + key.len()) as u64,
+                // Apunta al valor, pasada ya la caducidad si la hay: así `get`
+                // no tiene que saber nada de esto.
+                vpos: start
+                    + (HEADER + key.len()) as u64
+                    + if caduca == 0 {
+                        0
+                    } else {
+                        wal::TTL_BYTES as u64
+                    },
                 seq,
+                caduca,
             };
             let old = inner.shard(key).set(key, loc);
             inner.live.fetch_add(rlen, Ordering::Relaxed);
             if let Some(o) = old {
-                let ol = rec_len(key.len(), o.vlen);
+                let ol = rec_len_con(key.len(), o.vlen, o.caduca != 0);
                 sub_sat(&inner.live, ol);
                 inner.dead.fetch_add(ol, Ordering::Relaxed);
             }
@@ -1100,6 +1356,400 @@ impl Db {
         Ok(())
     }
 
+    /// Escribe varias operaciones con **un solo `fsync`**.
+    ///
+    /// # Esto NO es una transacción
+    ///
+    /// Conviene decirlo antes que nada, porque el nombre de otras bases de
+    /// datos invita a suponer lo contrario. Si el proceso muere a mitad, al
+    /// reabrir puede haber quedado **un prefijo** del lote: las primeras
+    /// operaciones sí y las últimas no. Y un lector concurrente puede ver unas
+    /// operaciones del lote y otras no, porque las lecturas no toman el candado
+    /// de escritura.
+    ///
+    /// Hacerlo atómico exigiría un registro de confirmación en el log y que la
+    /// recuperación descartara los lotes sin confirmar, es decir, cambiar el
+    /// formato del WAL otra vez y reescribir la recuperación. Eso es un
+    /// proyecto en sí mismo, no un añadido, y `docs/AUDITORIA.md` ya lo dejó
+    /// fuera a propósito.
+    ///
+    /// # Lo que sí garantiza
+    ///
+    /// * **Un `fsync` para todo el lote** en vez de uno por operación. Con
+    ///   `fsync=group` eso significa una espera en lugar de N.
+    /// * **Validación previa completa**: si alguna operación tiene una clave o
+    ///   un valor inválido, se devuelve el error y **no se escribe nada**. Un
+    ///   lote no se aplica a medias por un error de forma.
+    /// * **Deshacer total si falla la escritura**: el `set_len` de recuperación
+    ///   (A1) retrocede al principio del lote, no al de la última operación.
+    /// * Las operaciones se aplican **en el orden dado**, así que un `Put` y un
+    ///   `Delete` de la misma clave en el mismo lote acaban como dice el orden.
+    ///
+    /// Devuelve cuántos registros se escribieron de verdad, que puede ser menor
+    /// que `ops.len()`: borrar una clave que no está no escribe nada.
+    ///
+    /// El lote se construye **entero en memoria** antes de escribirlo.
+    pub fn write_batch(&self, ops: &[Op<'_>]) -> Result<usize> {
+        let r = self.batch_interno(None, ops).map(|n| n.unwrap_or(0));
+        if r.is_err() {
+            // Un lote fallido cuenta un error, no uno por operación: el cliente
+            // hizo una llamada.
+            if let Some(primera) = ops.first() {
+                mas(&self.inner.shard(primera.key()).ops.errores, 1);
+            }
+        }
+        r
+    }
+
+    /// Una vista con `nombre:` delante de cada clave. Ver [`Namespace`] para
+    /// lo que esto **no** es.
+    ///
+    /// El nombre no puede estar vacío ni contener el separador `:`. Lo segundo
+    /// no es tiquismiquis: si se permitiera, el namespace `a` con la clave
+    /// `b:c` y el namespace `a:b` con la clave `c` escribirían **en la misma
+    /// clave real**, y ninguno de los dos se enteraría.
+    pub fn namespace(&self, nombre: &[u8]) -> Result<Namespace<'_>> {
+        if nombre.is_empty() {
+            return Err(Error::Invalida(
+                "el nombre del namespace no puede estar vacío",
+            ));
+        }
+        if nombre.contains(&NS_SEP) {
+            return Err(Error::Invalida(
+                "el nombre del namespace no puede contener ':': dos namespaces distintos \
+                 acabarían escribiendo en la misma clave real",
+            ));
+        }
+        let mut prefijo = nombre.to_vec();
+        prefijo.push(NS_SEP);
+        if prefijo.len() >= MAX_KEY {
+            return Err(Error::Invalida(
+                "el nombre del namespace no deja sitio para ninguna clave",
+            ));
+        }
+        Ok(Namespace { db: self, prefijo })
+    }
+
+    /// El número de secuencia de una clave, que funciona como su número de
+    /// versión: cambia en cada escritura y nunca se repite. Es lo que espera
+    /// [`Db::compare_and_swap_seq`].
+    pub fn seq(&self, key: &[u8]) -> Option<u64> {
+        let ahora = ahora_ms();
+        rd(&self.inner.shard(key).map)
+            .get(key)
+            .filter(|l| l.vigente(ahora))
+            .map(|l| l.seq)
+    }
+
+    /// Como `get`, pero devuelve también el número de secuencia, para poder
+    /// hacer después un `compare_and_swap_seq` sin una segunda consulta y sin
+    /// la carrera que habría entre dos llamadas separadas.
+    pub fn get_seq(&self, key: &[u8]) -> Result<Option<(u64, Vec<u8>)>> {
+        self.get_interno(key)
+    }
+
+    /// Compare-and-swap contra el **número de secuencia** en vez de contra el
+    /// valor. `seq_esperado: None` exige que la clave no exista.
+    ///
+    /// Es la versión barata: no lee el valor del disco, solo compara un entero
+    /// del índice. Para un bucle de concurrencia optimista es además la forma
+    /// correcta, porque distingue «el valor volvió a ser el mismo» de «nadie lo
+    /// ha tocado», cosa que el CAS por valor no puede.
+    pub fn compare_and_swap_seq(
+        &self,
+        key: &[u8],
+        seq_esperado: Option<u64>,
+        nuevo: Option<&[u8]>,
+    ) -> Result<bool> {
+        validate(key, None)?;
+        if let Some(v) = nuevo {
+            validate(key, Some(v))?;
+        }
+        let op = match nuevo {
+            Some(v) => Op::Put { key, value: v },
+            None => Op::Delete { key },
+        };
+        Ok(self
+            .batch_interno(Some((key, seq_esperado)), &[op])?
+            .is_some())
+    }
+
+    /// Compara y escribe en un solo paso: si el valor actual de `key` es
+    /// exactamente `esperado`, lo cambia por `nuevo`. Devuelve si lo hizo.
+    ///
+    /// `esperado: None` significa «la clave no debe existir» y `nuevo: None`
+    /// significa «bórrala», así que esto cubre crear-si-no-existe,
+    /// borrar-si-vale-X y el cambio condicional de toda la vida.
+    ///
+    /// # Cómo evita bloquear a los demás escritores
+    ///
+    /// Los valores están en disco, no en memoria, así que comparar exige
+    /// leerlos. Hacer esa lectura con el candado de escritura en la mano
+    /// pararía a **todos** los escritores durante una entrada/salida, que con
+    /// la caché fría son milisegundos. En vez de eso:
+    ///
+    /// 1. Se lee el valor y se compara **sin** el candado de escritura.
+    /// 2. Se toma el candado y se comprueba que el número de secuencia de la
+    ///    clave **sigue siendo el mismo** que cuando se leyó. El `seq` del
+    ///    índice es, de hecho, un número de versión por clave.
+    /// 3. Solo entonces se escribe.
+    ///
+    /// Si alguien cambió la clave entre 1 y 2, el CAS devuelve `false`: no es
+    /// un fallo, es exactamente lo que significa un compare-and-swap que
+    /// pierde la carrera. Quien lo use tiene que volver a leer y reintentar,
+    /// que es el bucle habitual de la concurrencia optimista.
+    ///
+    /// Una clave caducada cuenta como ausente a todos los efectos.
+    pub fn compare_and_swap(
+        &self,
+        key: &[u8],
+        esperado: Option<&[u8]>,
+        nuevo: Option<&[u8]>,
+    ) -> Result<bool> {
+        validate(key, None)?;
+        if let Some(v) = nuevo {
+            validate(key, Some(v))?;
+        }
+        let inner = &*self.inner;
+
+        // Paso 1: leer valor y número de secuencia **de la misma consulta al
+        // índice**, sin candado de escritura.
+        //
+        // Que vengan juntos no es un detalle de eficiencia, es lo que hace
+        // correcto el CAS. Una primera versión leía el valor con `get` y el
+        // `seq` en una segunda consulta, y entre las dos otro hilo podía
+        // escribir: el `seq` quedaba más nuevo que el valor comparado, la
+        // comprobación de abajo pasaba y el CAS escribía encima de un cambio
+        // ajeno. Con ocho hilos incrementando un contador se perdían 114 de
+        // 480 incrementos. Lo cazó `un_cas_no_se_lo_lleva_mas_de_uno`.
+        //
+        // El par es coherente porque los dos salen del mismo `Loc`: el log no
+        // se sobrescribe nunca en el sitio, así que los bytes que hay en
+        // `vpos` siguen siendo los de ese `seq` aunque la clave ya se haya
+        // reescrito en otra posición.
+        let c = &inner.shard(key).ops;
+        mas(&c.gets, 1);
+        let actual = self.get_interno(key).inspect_err(|_| mas(&c.errores, 1))?;
+        if let Some((_, v)) = &actual {
+            mas(&c.gets_hit, 1);
+            mas(&c.bytes_leidos, v.len() as u64);
+        }
+        let coincide = match (&actual, esperado) {
+            (None, None) => true,
+            (Some((_, a)), Some(e)) => a.as_slice() == e,
+            _ => false,
+        };
+        if !coincide {
+            return Ok(false);
+        }
+        // El `seq` que se espera encontrar al escribir. `None` = debe seguir
+        // sin existir.
+        let seq_esperado = actual.as_ref().map(|(s, _)| *s);
+
+        // Pasos 2 y 3: la precondición se comprueba dentro del candado, en el
+        // mismo camino de escritura que usa el lote. Así no hay un tercer sitio
+        // con la lógica de deshacer una escritura parcial.
+        let op = match nuevo {
+            Some(v) => Op::Put { key, value: v },
+            None => Op::Delete { key },
+        };
+        match self.batch_interno(Some((key, seq_esperado)), &[op])? {
+            Some(_) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    /// `precondicion`: `(clave, Some(seq))` exige que la clave siga en ese
+    /// número de secuencia; `(clave, None)` exige que siga sin existir.
+    /// Devuelve `None` si la precondición no se cumplió y no se escribió nada.
+    fn batch_interno(
+        &self,
+        precondicion: Option<(&[u8], Option<u64>)>,
+        ops: &[Op<'_>],
+    ) -> Result<Option<usize>> {
+        // Todo validado antes de tocar el disco.
+        for op in ops {
+            match op {
+                Op::Put { key, value } => validate_con_ttl(key, value, false)?,
+                Op::PutTtl { key, value, ttl } => {
+                    if ttl.is_zero() {
+                        return Err(Error::Invalida(
+                            "un TTL de 0 en un lote no es una escritura con caducidad, es un borrado",
+                        ));
+                    }
+                    validate_con_ttl(key, value, true)?
+                }
+                Op::Delete { key } => validate(key, None)?,
+            }
+        }
+        if ops.is_empty() {
+            return Ok(Some(0));
+        }
+        let inner = &*self.inner;
+        inner.check_writable()?;
+
+        let ahora = ahora_ms();
+        let mut escritos = 0usize;
+        let seq_final;
+        {
+            let mut w = lk(&inner.writer);
+
+            // La precondición del CAS, dentro del candado: desde aquí hasta
+            // que se escribe, ningún otro escritor puede meterse.
+            if let Some((clave, seq_esperado)) = precondicion {
+                let visto = rd(&inner.shard(clave).map)
+                    .get(clave)
+                    .filter(|l| l.vigente(ahora))
+                    .map(|l| l.seq);
+                if visto != seq_esperado {
+                    return Ok(None);
+                }
+            }
+
+            // Qué se va a escribir, resuelto ya: los borrados de claves que no
+            // están no generan registro, y hay que saberlo para calcular el
+            // tamaño antes de decidir si se cierra el segmento.
+            let mut plan: Vec<(&Op<'_>, u64, u64)> = Vec::with_capacity(ops.len());
+            let mut total = 0u64;
+            for op in ops {
+                let (rlen, caduca) = match op {
+                    Op::Put { key, value } => (rec_len(key.len(), value.len() as u32), 0u64),
+                    Op::PutTtl { key, value, ttl } => {
+                        let ms = ttl.as_millis().min(u128::from(u64::MAX)) as u64;
+                        (
+                            rec_len_con(key.len(), value.len() as u32, true),
+                            ahora.saturating_add(ms).max(1),
+                        )
+                    }
+                    Op::Delete { key } => {
+                        let hay = rd(&inner.shard(key).map)
+                            .get(*key)
+                            .is_some_and(|l| l.vigente(ahora));
+                        if !hay {
+                            continue;
+                        }
+                        (rec_len(key.len(), 0), 0)
+                    }
+                };
+                total += rlen;
+                plan.push((op, rlen, caduca));
+            }
+            if plan.is_empty() {
+                // Sin nada que escribir, pero la precondición se cumplió: para
+                // un CAS que pedía borrar algo que ya no estaba, eso es un
+                // éxito, no un fracaso.
+                return Ok(Some(0));
+            }
+
+            // Se cierra el segmento **una vez**, antes del lote, y el lote
+            // entero va al mismo fichero. Si el lote es más grande que el
+            // tamaño máximo de segmento, el segmento lo excede: es la misma
+            // regla que para un registro suelto más grande que el máximo
+            // (B1 en docs/AUDITORIA.md), aplicada al lote.
+            if w.len > 0 && w.len + total > inner.opts.max_segment_bytes {
+                self.inner.roll(&mut w)?;
+            }
+
+            let start = w.len;
+            let seq0 = w.next_seq;
+            {
+                let Writer { file, buf, .. } = &mut *w;
+                buf.clear();
+                // El `seq` sale de un rango emparejado con el plan, no de un
+                // contador a mano: así no puede descolocarse respecto al que
+                // usa el bucle del índice más abajo.
+                for (seq, (op, _, caduca)) in (seq0..).zip(plan.iter()) {
+                    match op {
+                        Op::Put { key, value } => wal::encode(buf, seq, Kind::Put, key, value),
+                        Op::PutTtl { key, value, .. } => {
+                            wal::encode_ttl(buf, seq, key, value, *caduca)
+                        }
+                        Op::Delete { key } => wal::encode(buf, seq, Kind::Del, key, &[]),
+                    }
+                }
+                let mut f: &File = file;
+                if let Err(e) = f.write_all(buf) {
+                    // Igual que en `put`, pero retrocediendo el lote completo.
+                    if let Err(e2) = file.set_len(start) {
+                        inner.mark_failed(&e2);
+                        return Err(inner.no_escribible(&format!(
+                            "no se pudo deshacer un lote parcial en el byte {start}: \
+                             {e2} (el fallo original fue: {e})"
+                        )));
+                    }
+                    return Err(e.into());
+                }
+                // Un lote grande deja el búfer del escritor grande para
+                // siempre. Se devuelve la memoria si se ha pasado de la raya.
+                if buf.capacity() > (1 << 20) {
+                    buf.shrink_to(4096);
+                }
+            }
+
+            seq_final = seq0 + plan.len() as u64 - 1;
+            w.next_seq = seq_final + 1;
+            w.len = start + total;
+            if inner.opts.fsync == FsyncPolicy::Always {
+                inner.sync_file_or_fail(&w.file)?;
+                inner.mark_synced(seq_final);
+            }
+
+            // Y ahora el índice, en el mismo orden en que se escribió.
+            let file_id = w.id;
+            let mut pos = start;
+            for (seq, (op, rlen, caduca)) in (seq0..).zip(plan.iter()) {
+                match op {
+                    Op::Put { key, value } | Op::PutTtl { key, value, .. } => {
+                        if *caduca != 0 {
+                            inner.hay_ttl.store(true, Ordering::Relaxed);
+                        }
+                        let loc = Loc {
+                            file_id,
+                            vlen: value.len() as u32,
+                            vpos: pos
+                                + (HEADER + key.len()) as u64
+                                + if *caduca == 0 {
+                                    0
+                                } else {
+                                    wal::TTL_BYTES as u64
+                                },
+                            seq,
+                            caduca: *caduca,
+                        };
+                        let sh = inner.shard(key);
+                        let old = sh.set(key, loc);
+                        inner.live.fetch_add(*rlen, Ordering::Relaxed);
+                        if let Some(o) = old {
+                            let ol = rec_len_con(key.len(), o.vlen, o.caduca != 0);
+                            sub_sat(&inner.live, ol);
+                            inner.dead.fetch_add(ol, Ordering::Relaxed);
+                        }
+                        mas(&sh.ops.puts, 1);
+                        mas(&sh.ops.bytes_escritos, *rlen);
+                    }
+                    Op::Delete { key } => {
+                        let sh = inner.shard(key);
+                        let old = wr(&sh.map).remove(*key);
+                        if let Some(o) = old {
+                            let ol = rec_len_con(key.len(), o.vlen, o.caduca != 0);
+                            sub_sat(&inner.live, ol);
+                            inner.dead.fetch_add(ol + *rlen, Ordering::Relaxed);
+                        }
+                        mas(&sh.ops.deletes, 1);
+                        mas(&sh.ops.deletes_hit, 1);
+                        mas(&sh.ops.bytes_escritos, *rlen);
+                    }
+                }
+                pos += rlen;
+                escritos += 1;
+            }
+        }
+        if inner.opts.fsync == FsyncPolicy::Group {
+            inner.wait_synced(seq_final)?;
+        }
+        Ok(Some(escritos))
+    }
+
     /// Lee el valor de una clave. Los valores no están en memoria: esto va al
     /// disco (o a la caché de páginas del sistema).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1107,17 +1757,20 @@ impl Db {
         let c = &self.inner.shard(key).ops;
         mas(&c.gets, 1);
         match &r {
-            Ok(Some(v)) => {
+            Ok(Some((_, v))) => {
                 mas(&c.gets_hit, 1);
                 mas(&c.bytes_leidos, v.len() as u64);
             }
             Ok(None) => {}
             Err(_) => mas(&c.errores, 1),
         }
-        r
+        r.map(|o| o.map(|(_, v)| v))
     }
 
-    fn get_interno(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// Devuelve `(seq, valor)`: el número de secuencia sale del mismo sitio del
+    /// índice que la posición del valor, así que darlo no cuesta nada y evita
+    /// que quien quiera hacer un CAS tenga que preguntar dos veces.
+    fn get_interno(&self, key: &[u8]) -> Result<Option<(u64, Vec<u8>)>> {
         let inner = &*self.inner;
         let shard = inner.shard(key);
         // La compactación puede retirar un segmento entre que se consulta el
@@ -1135,12 +1788,18 @@ impl Db {
                 Some(l) => *l,
                 None => return Ok(None),
             };
+            // Caducada: para quien pregunta, no existe. No se borra aquí
+            // —hacerlo exigiría el candado de escritura en el camino de
+            // lectura—; de eso se encarga la compactación.
+            if !loc.vigente(ahora_ms()) {
+                return Ok(None);
+            }
             if let Some(file) = rd(&inner.segments).get(&loc.file_id).map(Arc::clone) {
                 let mut buf = vec![0u8; loc.vlen as usize];
                 if loc.vlen > 0 {
                     file.read_exact_at(&mut buf, loc.vpos)?;
                 }
-                return Ok(Some(buf));
+                return Ok(Some((loc.seq, buf)));
             }
             vueltas += 1;
             mas(&shard.ops.get_reintentos, 1);
@@ -1168,7 +1827,26 @@ impl Db {
     }
 
     pub fn exists(&self, key: &[u8]) -> bool {
-        rd(&self.inner.shard(key).map).contains_key(key)
+        let ahora = ahora_ms();
+        rd(&self.inner.shard(key).map)
+            .get(key)
+            .is_some_and(|l| l.vigente(ahora))
+    }
+
+    /// Cuánto le queda a una clave: `None` si no está, `Some(None)` si no
+    /// caduca, `Some(Some(d))` con lo que falta.
+    ///
+    /// No toca el disco: la caducidad está en el índice.
+    pub fn ttl(&self, key: &[u8]) -> Option<Option<Duration>> {
+        let ahora = ahora_ms();
+        let l = *rd(&self.inner.shard(key).map).get(key)?;
+        if !l.vigente(ahora) {
+            return None;
+        }
+        if l.caduca == 0 {
+            return Some(None);
+        }
+        Some(Some(Duration::from_millis(l.caduca.saturating_sub(ahora))))
     }
 
     /// Devuelve `true` si la clave existía. Escribe una lápida en el log.
@@ -1200,6 +1878,12 @@ impl Db {
                 Some(l) => *l,
                 None => return Ok(false),
             };
+            // Borrar una clave caducada es borrar algo que ya no existe:
+            // devuelve `false` y no escribe lápida. Escribirla sería gastar
+            // disco para enterrar a un muerto.
+            if !old.vigente(ahora_ms()) {
+                return Ok(false);
+            }
             let rlen = rec_len(key.len(), 0);
             if w.len > 0 && w.len + rlen > inner.opts.max_segment_bytes {
                 self.inner.roll(&mut w)?;
@@ -1230,7 +1914,7 @@ impl Db {
                 inner.mark_synced(seq);
             }
             wr(&shard.map).remove(key);
-            let ol = rec_len(key.len(), old.vlen);
+            let ol = rec_len_con(key.len(), old.vlen, old.caduca != 0);
             sub_sat(&inner.live, ol);
             inner.dead.fetch_add(ol + rlen, Ordering::Relaxed);
         }
@@ -1252,10 +1936,11 @@ impl Db {
     pub fn keys(&self, prefix: &[u8], limite: usize) -> (Vec<Vec<u8>>, bool) {
         let mut heap: BinaryHeap<Vec<u8>> = BinaryHeap::new();
         let mut total = 0usize;
+        let ahora = ahora_ms();
         for s in &self.inner.shards {
             let m = rd(&s.map);
-            for k in m.keys() {
-                if !k.starts_with(prefix) {
+            for (k, l) in m.iter() {
+                if !k.starts_with(prefix) || !l.vigente(ahora) {
                     continue;
                 }
                 total += 1;
@@ -1273,8 +1958,18 @@ impl Db {
         (out, total > limite)
     }
 
+    /// Claves vivas. Sin TTL en juego es O(particiones); con TTL hay que
+    /// contar saltándose las caducadas, y entonces es O(claves).
     pub fn len(&self) -> usize {
-        self.inner.shards.iter().map(|s| rd(&s.map).len()).sum()
+        if !self.inner.hay_ttl.load(Ordering::Relaxed) {
+            return self.inner.shards.iter().map(|s| rd(&s.map).len()).sum();
+        }
+        let ahora = ahora_ms();
+        self.inner
+            .shards
+            .iter()
+            .map(|s| rd(&s.map).values().filter(|l| l.vigente(ahora)).count())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1288,11 +1983,21 @@ impl Db {
         // Los contadores de operaciones se suman aquí, en el recorrido de
         // particiones que `stats` ya hacía: no cuesta ninguna pasada extra.
         let mut ops = [0u64; 9];
+        let ahora = ahora_ms();
+        let mut caducadas = 0u64;
         for s in &inner.shards {
             let m = rd(&s.map);
-            keys += m.len() as u64;
-            for k in m.keys() {
+            for (k, l) in m.iter() {
+                // `keys` son las claves **visibles**; `key_bytes` cuenta todas
+                // las entradas, caducadas incluidas, porque ocupan RAM hasta
+                // que la compactación las retira. Son dos preguntas distintas
+                // y mezclarlas haría mentir a una de las dos.
                 key_bytes += k.len() as u64;
+                if l.vigente(ahora) {
+                    keys += 1;
+                } else {
+                    caducadas += 1;
+                }
             }
             drop(m);
             let c = &s.ops;
@@ -1335,7 +2040,11 @@ impl Db {
             live_bytes: inner.live.load(Ordering::Relaxed),
             dead_bytes: inner.dead.load(Ordering::Relaxed),
             // 24 bytes de Loc + 16 del puntero gordo a la clave + ~8 de la tabla hash.
-            index_bytes_est: key_bytes + keys * (24 + 16 + 8),
+            // 32 bytes de Loc (eran 24 antes del TTL) + 16 del puntero gordo a
+            // la clave + ~8 de la tabla hash. Se cuentan **todas** las
+            // entradas, también las caducadas que aún no se han retirado:
+            // esto es RAM ocupada, no claves útiles.
+            index_bytes_est: key_bytes + (keys + caducadas) * (32 + 16 + 8),
             last_seq,
             synced_seq,
             fsync: inner.opts.fsync.name().to_string(),
@@ -2018,6 +2727,10 @@ impl Inner {
         let mut out: Option<OutSeg> = None;
         let mut copied = 0u64;
         let mut scanned = 0u64;
+        let mut caducadas_retiradas = 0u64;
+        // Un solo instante para toda la compactación, por el mismo motivo que
+        // al recuperar: dos claves no deben juzgarse con relojes distintos.
+        let ahora = ahora_ms();
 
         for &id in &old_ids {
             let path = seg_path(&self.opts.dir, id);
@@ -2061,7 +2774,22 @@ impl Inner {
                 if cur.file_id != id || cur.vpos != r.vpos {
                     continue; // hay una versión más nueva en otro sitio
                 }
-                let rlen = rec_len(r.key.len(), r.value.len() as u32);
+                // Caducada: no se copia, y además se saca del índice. Esto es
+                // lo único que recupera de verdad la RAM de una clave con TTL;
+                // hasta aquí solo había dejado de verse.
+                //
+                // Se comprueba contra `cur` antes de quitarla, igual que al
+                // mover el puntero: si alguien ha reescrito la clave mientras
+                // compactábamos, la entrada que hay ya no es esta y no se toca.
+                if !cur.vigente(ahora) {
+                    let mut m = wr(&shard.map);
+                    if m.get(&r.key[..]) == Some(&cur) {
+                        m.remove(&r.key[..]);
+                        caducadas_retiradas += 1;
+                    }
+                    continue;
+                }
+                let rlen = rec_len_con(r.key.len(), r.value.len() as u32, cur.caduca != 0);
                 let needs_new = match &out {
                     None => true,
                     Some(o) => o.len > 0 && o.len + rlen > self.opts.max_segment_bytes,
@@ -2074,7 +2802,16 @@ impl Inner {
                 }
                 let o = out.as_mut().unwrap();
                 o.buf.clear();
-                wal::encode(&mut o.buf, r.seq, Kind::Put, &r.key, &r.value);
+                // Una clave con caducidad se reescribe **con su caducidad**: la
+                // compactación no es sitio para cambiar la semántica de un
+                // dato. (`cur.caduca` y `r.caduca` son el mismo valor aquí: la
+                // comprobación de `vpos` de arriba ya garantiza que el registro
+                // leído es exactamente el que el índice señala.)
+                if cur.caduca == 0 {
+                    wal::encode(&mut o.buf, r.seq, Kind::Put, &r.key, &r.value);
+                } else {
+                    wal::encode_ttl(&mut o.buf, r.seq, &r.key, &r.value, cur.caduca);
+                }
                 {
                     let mut f: &File = &o.file;
                     f.write_all(&o.buf)?;
@@ -2082,8 +2819,15 @@ impl Inner {
                 let newloc = Loc {
                     file_id: o.id,
                     vlen: r.value.len() as u32,
-                    vpos: o.len + (HEADER + r.key.len()) as u64,
+                    vpos: o.len
+                        + (HEADER + r.key.len()) as u64
+                        + if cur.caduca == 0 {
+                            0
+                        } else {
+                            wal::TTL_BYTES as u64
+                        },
                     seq: r.seq,
+                    caduca: cur.caduca,
                 };
                 o.len += rlen;
                 copied += rlen;
@@ -2130,6 +2874,7 @@ impl Inner {
             segments_removed: old_ids.len(),
             bytes_before: scanned,
             bytes_after: copied,
+            expired_removed: caducadas_retiradas,
         })
     }
 
@@ -2145,7 +2890,7 @@ impl Inner {
         for s in &self.shards {
             let m = rd(&s.map);
             for (k, l) in m.iter() {
-                live += rec_len(k.len(), l.vlen);
+                live += rec_len_con(k.len(), l.vlen, l.caduca != 0);
             }
         }
         self.live.store(live, Ordering::Relaxed);

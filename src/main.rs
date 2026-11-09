@@ -1,6 +1,6 @@
 use bitacora::log;
 use bitacora::server::{instalar_senales, serve, ServerConfig};
-use bitacora::{demo_value, Db, FsyncPolicy, Options, RecoveryPolicy};
+use bitacora::{demo_value, Db, FsyncPolicy, Op, Options, RecoveryPolicy};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -663,6 +663,54 @@ fn cmd_bench(args: &[String]) -> i32 {
     set.dur = t0.elapsed();
     set.ops = total;
 
+    // --- SET en lotes ---
+    // Lo que se quiere medir es lo único que el lote promete: un fsync para
+    // todo el lote en vez de uno por escritura. Se usa una cuarta parte de las
+    // operaciones y un espacio de claves aparte para no ensuciar las fases
+    // siguientes.
+    let lote: usize = opt_or(args, "--lote", 100);
+    let por_hilo_lote = (per / 4).max(1);
+    let t0 = Instant::now();
+    let hs: Vec<_> = (0..threads as u64)
+        .map(|t| {
+            let db = Arc::clone(&db);
+            let value = value.clone();
+            thread::spawn(move || {
+                let mut lat = Vec::with_capacity(por_hilo_lote as usize);
+                let mut j = 0u64;
+                while j < por_hilo_lote {
+                    let n = lote.min((por_hilo_lote - j) as usize);
+                    let claves: Vec<String> = (0..n)
+                        .map(|i| format!("lote{:010}", t * por_hilo_lote + j + i as u64))
+                        .collect();
+                    let ops: Vec<Op> = claves
+                        .iter()
+                        .map(|k| Op::Put {
+                            key: k.as_bytes(),
+                            value: &value,
+                        })
+                        .collect();
+                    let t1 = Instant::now();
+                    db.write_batch(&ops).expect("lote");
+                    // La latencia se reparte entre las operaciones del lote:
+                    // lo que interesa es el coste por operación, no por lote.
+                    let por_op = t1.elapsed().as_nanos() as u64 / n as u64;
+                    for _ in 0..n {
+                        lat.push(por_op);
+                    }
+                    j += n as u64;
+                }
+                lat
+            })
+        })
+        .collect();
+    let mut setl = Fase::nueva("SET en lotes");
+    for h in hs {
+        setl.lat.extend(h.join().unwrap());
+    }
+    setl.dur = t0.elapsed();
+    setl.ops = por_hilo_lote * threads as u64;
+
     // --- GET cruzado: cada hilo lee las claves de otro, para repartir shards ---
     let t0 = Instant::now();
     let hs: Vec<_> = (0..threads as u64)
@@ -769,6 +817,7 @@ fn cmd_bench(args: &[String]) -> i32 {
         "fase", "rendimiento", "p50 us", "p95 us", "p99 us", "p99,9 us", "max us"
     );
     set.imprime();
+    setl.imprime();
     get.imprime();
     getc.imprime();
     del.imprime();

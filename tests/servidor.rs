@@ -545,3 +545,161 @@ fn una_configuracion_absurda_no_llega_a_escuchar() {
     }
     db.close().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Gate 7 · caducidad, CAS y namespaces por el protocolo
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setex_y_ttl_por_el_protocolo() {
+    let tmp = TempDir::new("srv-ttl");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    let srv = Servidor::nuevo(Arc::clone(&db), ServerConfig::new("127.0.0.1", puerto(14)));
+
+    let r = srv.pide(
+        "SETEX s 60 un valor con espacios\nTTL s\nGET s\nTTL no-esta\n",
+        4,
+    );
+    assert_eq!(r[0], "OK");
+    assert_eq!(r[1], "INT 60");
+    assert_eq!(r[2], "VAL un valor con espacios");
+    assert_eq!(r[3], "NIL", "una clave que no está no tiene TTL");
+
+    // Una clave sin caducidad se distingue de una que no está.
+    let r = srv.pide("SET fija v\nTTL fija\n", 2);
+    assert_eq!(r[1], "INT -1", "-1 es «no caduca»");
+
+    // Y 0 segundos no es un borrado disfrazado.
+    let r = srv.pide("SETEX s 0 v\n", 1);
+    assert!(r[0].starts_with("ERR invalida"), "{}", r[0]);
+    db.close().unwrap();
+}
+
+/// La caducidad se ve de verdad desde el protocolo, no solo se declara.
+#[test]
+fn una_clave_caduca_y_el_protocolo_deja_de_verla() {
+    let tmp = TempDir::new("srv-ttl-vence");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    let srv = Servidor::nuevo(Arc::clone(&db), ServerConfig::new("127.0.0.1", puerto(15)));
+
+    // Por el protocolo el mínimo es 1 segundo, así que se espera 1,2 s.
+    let r = srv.pide("SETEX corta 1 adios\nGET corta\n", 2);
+    assert_eq!(r[1], "VAL adios");
+    thread::sleep(Duration::from_millis(1200));
+    let r = srv.pide("GET corta\nEXISTS corta\nTTL corta\nKEYS\n", 4);
+    assert_eq!(r[0], "NIL");
+    assert_eq!(r[1], "INT 0");
+    assert_eq!(r[2], "NIL");
+    assert_eq!(r[3], "KEYS 0", "KEYS tampoco la ve");
+    db.close().unwrap();
+}
+
+#[test]
+fn getseq_y_cas_por_el_protocolo() {
+    let tmp = TempDir::new("srv-cas");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    let srv = Servidor::nuevo(Arc::clone(&db), ServerConfig::new("127.0.0.1", puerto(16)));
+
+    // seq 0 = «no debe existir»: crea si no está, y solo una vez.
+    let r = srv.pide("CAS k 0 primero\nCAS k 0 otro\nGET k\n", 3);
+    assert_eq!(r[0], "OK");
+    assert!(r[1].starts_with("NO "), "{}", r[1]);
+    assert_eq!(r[2], "VAL primero");
+
+    // GETSEQ da valor y seq juntos; con ese seq el CAS entra.
+    let r = srv.pide("GETSEQ k\n", 1);
+    let campos: Vec<&str> = r[0].splitn(3, ' ').collect();
+    assert_eq!(campos[0], "VALSEQ", "{}", r[0]);
+    assert_eq!(campos[2], "primero");
+    let seq: u64 = campos[1].parse().expect("seq numérico");
+
+    let r = srv.pide(&format!("CAS k {seq} segundo\nGET k\n"), 2);
+    assert_eq!(r[0], "OK");
+    assert_eq!(r[1], "VAL segundo");
+
+    // Y con el seq viejo ya no: devuelve NO con el seq actual, para poder
+    // reintentar sin otra consulta.
+    let r = srv.pide(&format!("CAS k {seq} tercero\n"), 1);
+    assert!(r[0].starts_with("NO "), "{}", r[0]);
+    let actual: u64 = r[0][3..].parse().expect("NO <seq>");
+    assert!(actual > seq, "el seq nuevo tiene que ser mayor: {actual}");
+    assert_eq!(srv.pide("GET k\n", 1)[0], "VAL segundo", "no se tocó");
+
+    // CASDEL igual.
+    let r = srv.pide(&format!("CASDEL k {seq}\nCASDEL k {actual}\nGET k\n"), 3);
+    assert!(r[0].starts_with("NO "), "{}", r[0]);
+    assert_eq!(r[1], "OK");
+    assert_eq!(r[2], "NIL");
+    db.close().unwrap();
+}
+
+#[test]
+fn use_pone_un_prefijo_solo_en_su_conexion() {
+    let tmp = TempDir::new("srv-ns");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    let srv = Servidor::nuevo(Arc::clone(&db), ServerConfig::new("127.0.0.1", puerto(17)));
+
+    let r = srv.pide("USE app\nSET k de app\nGET k\nKEYS\n", 5);
+    assert_eq!(r[0], "OK app:");
+    assert_eq!(r[1], "OK");
+    assert_eq!(r[2], "VAL de app");
+    assert_eq!(r[3], "KEYS 1");
+    assert_eq!(r[4], "k", "KEYS devuelve la clave SIN el prefijo");
+
+    // Otra conexión, sin USE, ve la clave real: esto no es aislamiento.
+    let r = srv.pide("GET k\nGET app:k\n", 2);
+    assert_eq!(r[0], "NIL", "sin USE, `k` es otra clave");
+    assert_eq!(r[1], "VAL de app");
+
+    // USE sin argumento lo quita, en la misma conexión.
+    let r = srv.pide("USE app\nSET x 1\nUSE\nGET x\nGET app:x\n", 5);
+    assert_eq!(r[2], "OK");
+    assert_eq!(r[3], "NIL", "ya sin prefijo");
+    assert_eq!(r[4], "VAL 1");
+
+    // Un nombre con ':' se rechaza, con el mismo motivo que en la API.
+    let r = srv.pide("USE a:b\n", 1);
+    assert!(r[0].starts_with("ERR invalida"), "{}", r[0]);
+
+    // Y el prefijo alcanza también a SETEX, TTL, CAS y DEL.
+    let r = srv.pide(
+        "USE app\nSETEX t 60 v\nTTL t\nCAS c 0 uno\nDEL k\nEXISTS k\n",
+        6,
+    );
+    assert_eq!(r[1], "OK");
+    assert_eq!(r[2], "INT 60");
+    assert_eq!(r[3], "OK");
+    assert_eq!(r[4], "OK");
+    assert_eq!(r[5], "INT 0");
+    assert_eq!(srv.pide("GET app:c\n", 1)[0], "VAL uno");
+    db.close().unwrap();
+}
+
+#[test]
+fn las_ordenes_nuevas_tambien_exigen_auth() {
+    let tmp = TempDir::new("srv-nuevas-auth");
+    let db = Arc::new(Db::open(opts(tmp.path())).unwrap());
+    let mut cfg = ServerConfig::new("127.0.0.1", puerto(18));
+    cfg.clave = Some("secreta".into());
+    let srv = Servidor::nuevo(Arc::clone(&db), cfg);
+
+    for orden in [
+        "SETEX k 60 v\n",
+        "TTL k\n",
+        "GETSEQ k\n",
+        "CAS k 0 v\n",
+        "CASDEL k 1\n",
+        "USE app\n",
+    ] {
+        let r = srv.pide(orden, 1);
+        assert!(
+            r[0].starts_with("ERR invalida hace falta AUTH"),
+            "{orden:?} sin AUTH devolvió: {}",
+            r[0]
+        );
+    }
+    let r = srv.pide("AUTH secreta\nUSE app\nSETEX k 60 v\nTTL k\n", 4);
+    assert_eq!(r[1], "OK app:");
+    assert_eq!(r[3], "INT 60");
+    db.close().unwrap();
+}

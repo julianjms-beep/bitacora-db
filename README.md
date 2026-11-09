@@ -76,6 +76,12 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
+SETEX sesion 60 token      → OK            (expires in 60 s)
+TTL sesion                 → INT 60        (or INT -1: never; NIL: absent)
+GETSEQ user:1              → VALSEQ 7 Ana Garcia
+CAS user:1 7 Ana Gil       → OK            (or NO <current seq>; seq 0 = must not exist)
+CASDEL user:1 9            → OK | NO <current seq>
+USE app                    → OK app:       (prefix for this connection only)
 STATS                      → STATS 29  /  keys 0 / … / health ok / estado ok
 HEALTH                     → HEALTH ok 0        (or aviso / critico, plus reasons)
 METRICS                    → METRICS 100        (Prometheus exposition format)
@@ -109,7 +115,7 @@ with the event and metric catalogues and the backup procedures, is in
 Tests and benchmark:
 
 ```bash
-cargo test                                   # 92 tests (unit + integration)
+cargo test                                   # 117 tests (unit + integration)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -340,7 +346,7 @@ passes `BITACORA_SEMILLA=<run number>` so every run explores a different slice
 of the random space instead of re-checking the same 965 cases. A failure prints
 its seed and iteration, so it replays exactly.
 
-## Tests (92)
+## Tests (117)
 
 * `crc32`: standard vector, chunked computation.
 * `wal`: round trip, truncated tail, flipped bit.
@@ -362,7 +368,7 @@ its seed and iteration, so it replays exactly.
   recovery never *fabricates* data, only loses it; and the engine matches a
   `HashMap` model across a random operation sequence, before and after restart.
   48,000 cases across five seeds have been run by hand on top of CI.
-* Server hardening (`tests/servidor.rs`, 13 tests): operating before `AUTH`,
+* Server hardening (`tests/servidor.rs`, 18 tests): operating before `AUTH`,
   a wrong key, refusing to bind off-localhost without one, the `KEYS` cap and
   its ordering, values with newlines in both directions, the response size cap,
   the connection limit and that slots are released, a mute connection being
@@ -387,6 +393,15 @@ its seed and iteration, so it replays exactly.
   validator, including a data directory whose name contains a quote and a
   backslash, and the test asserts that a known key and value **never appear in
   the log**.
+* Features (`tests/funcionalidad.rs`, 16 tests): an expired key does **not**
+  come back after a restart — and neither does the value that key held *before*
+  the `put_ttl`, which is what would happen if recovery merely ignored the
+  expired record; compaction removes expired keys from the index (the only
+  thing that actually reclaims their RAM) and preserves a live expiry; eight
+  threads incrementing a counter through CAS lose **no** increments (this test
+  caught a real race in the first version of CAS — 366 of 480 increments
+  survived); a batch with one invalid operation writes **nothing**; and a log
+  containing expiries, batches and CAS writes opens in strict mode.
 * Operator commands (`tests/cli.rs`, 5 tests, against the real binary): the
   **exit codes**, which is what a container healthcheck actually reads —
   `verificar` returns 1 and `INTEGRO: no` on a flipped bit; backup → restore →

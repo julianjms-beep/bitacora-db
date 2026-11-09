@@ -42,6 +42,12 @@ EXISTS user:1              → INT 1
 KEYS user:                 → KEYS 1  /  user:1
 DEL user:1                 → OK
 GET user:1                 → NIL
+SETEX sesion 60 token      → OK            (caduca en 60 s)
+TTL sesion                 → INT 60        (o INT -1: no caduca; NIL: no está)
+GETSEQ user:1              → VALSEQ 7 Ana Garcia
+CAS user:1 7 Ana Gil       → OK            (o NO <seq actual>; seq 0 = no debe existir)
+CASDEL user:1 9            → OK | NO <seq actual>
+USE app                    → OK app:       (prefijo solo de esta conexión)
 STATS                      → STATS 29  /  keys 0 / ... / health ok / estado ok
 HEALTH                     → HEALTH ok 0        (o aviso / critico, con motivos)
 METRICS                    → METRICS 100        (formato de Prometheus)
@@ -76,7 +82,7 @@ procedimientos de copia, está en [docs/OPERACION.md](docs/OPERACION.md).
 Pruebas y benchmark:
 
 ```bash
-cargo test                                   # 92 pruebas (unitarias + integración)
+cargo test                                   # 117 pruebas (unitarias + integración)
 ./target/release/bitacora bench --threads 8 --ops 200000 --fsync group
 ```
 
@@ -320,7 +326,7 @@ reproducible, y la CI les pasa `BITACORA_SEMILLA=<número de ejecución>`, así 
 cada vuelta explora una franja distinta del espacio en vez de repetir los mismos
 965 casos. Un fallo imprime su semilla y su iteración, y se reproduce exacto.
 
-## Pruebas (92)
+## Pruebas (117)
 
 * `crc32`: vector estándar, cálculo por trozos.
 * `wal`: ida y vuelta, cola cortada, bit cambiado.
@@ -343,7 +349,7 @@ cada vuelta explora una franja distinta del espacio en vez de repetir los mismos
   motor coincide con un modelo `HashMap` a lo largo de una secuencia aleatoria
   de operaciones, antes y después de reiniciar. Se han barrido 48.000 casos con
   cinco semillas a mano, además de lo que hace la CI.
-* Endurecimiento del servidor (`tests/servidor.rs`, 13 pruebas): operar sin
+* Endurecimiento del servidor (`tests/servidor.rs`, 18 pruebas): operar sin
   `AUTH`, clave equivocada, negarse a escuchar fuera de localhost sin clave, el
   tope de `KEYS` y su orden, valores con saltos de línea en los dos sentidos,
   el tope de tamaño de respuesta, el límite de conexiones y que las plazas se
@@ -370,6 +376,15 @@ cada vuelta explora una franja distinta del espacio en vez de repetir los mismos
   validador estricto de JSON, incluido el caso de un directorio de datos cuyo
   nombre lleva una comilla y una barra invertida, y se exige que una clave y un
   valor conocidos **no aparezcan nunca en el log**.
+* Funcionalidad (`tests/funcionalidad.rs`, 16 pruebas): una clave caducada
+  **no** reaparece al reiniciar, y tampoco reaparece el valor que esa clave
+  tenía *antes* del `put_ttl`, que es lo que pasaría si la recuperación se
+  limitara a ignorar el registro vencido; la compactación retira las caducadas
+  del índice (lo único que recupera su RAM) y conserva una caducidad vigente;
+  ocho hilos incrementando un contador con CAS **no** pierden ningún
+  incremento (esta prueba cazó una carrera real en la primera versión del CAS:
+  sobrevivían 366 de 480); un lote con una operación inválida **no** escribe
+  nada; y un log con caducidades, lotes y CAS abre en modo estricto.
 * Órdenes de operación (`tests/cli.rs`, 5 pruebas, contra el binario de
   verdad): los **códigos de salida**, que es lo que de verdad lee un
   `healthcheck` — `verificar` devuelve 1 y `INTEGRO: no` con un bit volteado;

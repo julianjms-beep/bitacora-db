@@ -11,6 +11,12 @@
 //! HEALTH               -> HEALTH <ok|aviso|critico> <n> seguido de n motivos
 //! METRICS              -> METRICS <n> seguido de n líneas (Prometheus)
 //! BACKUP [nombre]      -> OK <ruta> segmentos=.. bytes=.. | ERR
+//! SETEX clave segs val -> OK
+//! TTL clave            -> INT <segundos> | INT -1 (no caduca) | NIL (no está)
+//! GETSEQ clave         -> VALSEQ <seq> <valor> | NIL
+//! CAS clave seq valor  -> OK | NO <seq_actual>   (seq 0 = no debe existir)
+//! CASDEL clave seq     -> OK | NO <seq_actual>
+//! USE [namespace]      -> OK <prefijo>           (solo para esta conexión)
 //! COMPACT              -> OK ...
 //! PING                 -> PONG
 //! QUIT                 -> BYE
@@ -44,6 +50,34 @@ pub enum Command<'a> {
     /// que se configuró al arrancar. El nombre es **un solo componente de
     /// ruta**, nunca una ruta: el cliente no elige dónde escribe el servidor.
     Backup(Option<&'a [u8]>),
+    /// `SETEX clave <segundos> valor`: escribe con caducidad.
+    SetEx {
+        key: &'a [u8],
+        segundos: u64,
+        value: &'a [u8],
+    },
+    /// `TTL clave`: segundos que le quedan.
+    Ttl(&'a [u8]),
+    /// `GETSEQ clave`: el valor **y** su número de secuencia, en una sola
+    /// respuesta. Pedirlos por separado sería una carrera: el `seq` podría ser
+    /// más nuevo que el valor, y entonces un `CAS` con ese `seq` escribiría
+    /// encima de un cambio ajeno.
+    GetSeq(&'a [u8]),
+    /// `CAS clave <seq> valor`: escribe solo si la clave sigue en ese número de
+    /// secuencia. `seq = 0` significa «la clave no debe existir».
+    Cas {
+        key: &'a [u8],
+        seq: u64,
+        value: &'a [u8],
+    },
+    /// `CASDEL clave <seq>`: borra solo si la clave sigue en ese número.
+    CasDel {
+        key: &'a [u8],
+        seq: u64,
+    },
+    /// `USE [namespace]`: pone un prefijo delante de las claves de **esta**
+    /// conexión. Sin argumento, lo quita.
+    Use(Option<&'a [u8]>),
     Compact,
     Ping,
     Quit,
@@ -118,6 +152,49 @@ pub fn parse(line: &[u8]) -> Result<Command<'_>, &'static str> {
                 Some(nombre)
             }))
         }
+        b"SETEX" => {
+            let (key, resto) = split_word(rest);
+            let (secs, value) = split_word(resto);
+            if key.is_empty() || secs.is_empty() {
+                return Err("uso: SETEX clave segundos valor");
+            }
+            let segundos = numero(secs).ok_or("SETEX: los segundos tienen que ser un número")?;
+            if segundos == 0 {
+                return Err("SETEX con 0 segundos no es una escritura, es un borrado: usa DEL");
+            }
+            Ok(Command::SetEx {
+                key,
+                segundos,
+                value,
+            })
+        }
+        b"TTL" => one(rest, "uso: TTL clave").map(Command::Ttl),
+        b"GETSEQ" => one(rest, "uso: GETSEQ clave").map(Command::GetSeq),
+        b"CAS" => {
+            let (key, resto) = split_word(rest);
+            let (s, value) = split_word(resto);
+            if key.is_empty() || s.is_empty() {
+                return Err("uso: CAS clave seq valor (seq 0 = la clave no debe existir)");
+            }
+            let seq = numero(s).ok_or("CAS: el seq tiene que ser un número")?;
+            Ok(Command::Cas { key, seq, value })
+        }
+        b"CASDEL" => {
+            let (key, resto) = split_word(rest);
+            let (s, more) = split_word(resto);
+            if key.is_empty() || s.is_empty() || !more.is_empty() {
+                return Err("uso: CASDEL clave seq");
+            }
+            let seq = numero(s).ok_or("CASDEL: el seq tiene que ser un número")?;
+            Ok(Command::CasDel { key, seq })
+        }
+        b"USE" => {
+            let (ns, more) = split_word(rest);
+            if !more.is_empty() {
+                return Err("uso: USE [namespace] (un nombre, sin espacios)");
+            }
+            Ok(Command::Use(if ns.is_empty() { None } else { Some(ns) }))
+        }
         b"COMPACT" => Ok(Command::Compact),
         b"AUTH" => {
             let (clave, _) = split_word(rest);
@@ -131,9 +208,14 @@ pub fn parse(line: &[u8]) -> Result<Command<'_>, &'static str> {
         b"QUIT" | b"EXIT" => Ok(Command::Quit),
         b"" => Err("línea vacía"),
         _ => Err(
-            "comando desconocido (AUTH SET GET DEL EXISTS KEYS STATS HEALTH METRICS COMPACT PING QUIT)",
+            "comando desconocido (AUTH USE SET SETEX GET GETSEQ CAS CASDEL DEL EXISTS TTL \
+             KEYS STATS HEALTH METRICS BACKUP COMPACT PING QUIT)",
         ),
     }
+}
+
+fn numero(s: &[u8]) -> Option<u64> {
+    std::str::from_utf8(s).ok()?.parse().ok()
 }
 
 fn one<'a>(rest: &'a [u8], usage: &'static str) -> Result<&'a [u8], &'static str> {
@@ -203,5 +285,44 @@ mod tests {
             parse(b"BACKUP a b").is_err(),
             "un nombre con espacios no se acepta: no es una ruta"
         );
+        assert_eq!(
+            parse(b"SETEX s 60 un valor con espacios").unwrap(),
+            Command::SetEx {
+                key: b"s",
+                segundos: 60,
+                value: b"un valor con espacios"
+            }
+        );
+        assert!(parse(b"SETEX s 0 v").is_err(), "0 segundos es un borrado");
+        assert!(parse(b"SETEX s diez v").is_err());
+        assert!(parse(b"SETEX s").is_err());
+        assert_eq!(parse(b"TTL k").unwrap(), Command::Ttl(b"k"));
+        assert_eq!(parse(b"GETSEQ k").unwrap(), Command::GetSeq(b"k"));
+        assert_eq!(
+            parse(b"CAS k 7 nuevo valor").unwrap(),
+            Command::Cas {
+                key: b"k",
+                seq: 7,
+                value: b"nuevo valor"
+            }
+        );
+        assert_eq!(
+            parse(b"CAS k 0 ").unwrap(),
+            Command::Cas {
+                key: b"k",
+                seq: 0,
+                value: b""
+            },
+            "seq 0 = la clave no debe existir"
+        );
+        assert!(parse(b"CAS k noesnumero v").is_err());
+        assert_eq!(
+            parse(b"CASDEL k 9").unwrap(),
+            Command::CasDel { key: b"k", seq: 9 }
+        );
+        assert!(parse(b"CASDEL k 9 sobra").is_err());
+        assert_eq!(parse(b"USE app").unwrap(), Command::Use(Some(b"app")));
+        assert_eq!(parse(b"USE").unwrap(), Command::Use(None));
+        assert!(parse(b"USE a b").is_err());
     }
 }

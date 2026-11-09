@@ -18,8 +18,8 @@ pub mod wal;
 
 pub use error::{Error, Result};
 pub use store::{
-    BackupReport, CompactReport, Db, Estado, FsyncPolicy, Options, RecoveryPolicy, RecoveryReport,
-    Salud, Stats,
+    BackupReport, CompactReport, Db, Estado, FsyncPolicy, Namespace, Op, Options, RecoveryPolicy,
+    RecoveryReport, Salud, Stats,
 };
 
 /// Valor determinista para la clave `k{i}`; lo usan la prueba de apagón y el bench.

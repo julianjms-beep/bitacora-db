@@ -122,6 +122,42 @@ De paso, esto es un aviso sobre las cifras de la tabla de arriba: se tomaron en
 un rato tranquilo. El mismo binario, en una máquina cargada, da la mitad. Son
 reproducibles en método, no en valor absoluto.
 
+## Lo que aportan los lotes, y lo que cuesta el TTL (Gate 7)
+
+**Los lotes.** Escribir en lotes de 100 con `write_batch` frente a operación a
+operación, con `fsync=group`, medido en la **misma tirada** cada vez para que el
+ruido del portátil afecte a los dos lados por igual:
+
+| tirada | SET suelto | SET en lotes de 100 | veces |
+|---|---|---|---|
+| 1 | 37.661 ops/s | 631.354 ops/s | 16,8× |
+| 2 | 28.187 ops/s | 639.786 ops/s | 22,7× |
+| 3 | 40.752 ops/s | 522.606 ops/s | 12,8× |
+| 4 | 46.535 ops/s | 819.975 ops/s | 17,6× |
+
+**Entre 13 y 23 veces más rápido**, y la mediana por operación baja de 165-206
+µs a 7-11 µs. Es exactamente lo que promete el lote: un `fsync` para todo el
+lote en lugar de uno por escritura. Lo que **no** promete es atomicidad, y eso
+está dicho en `CAMBIOS.md` y en su documentación.
+
+La proporción varía tanto porque lo que oscila es el SET suelto; el lote es
+estable. Por eso se publica el rango de la proporción y no una cifra sola.
+
+**El coste del TTL en RAM.** La caducidad va en el índice para que `exists`,
+`len` y `KEYS` no toquen el disco, así que la entrada crece 8 bytes y los pagan
+**todas** las claves:
+
+| | por entrada del índice | con claves de 11 B |
+|---|---|---|
+| Antes del Gate 7 | 24 (Loc) + 16 + 8 = 48 B | 59 B/clave |
+| Después | 32 (Loc) + 16 + 8 = 56 B | **68 B/clave** |
+
+Los 68 B/clave son los que publica `STATS` y los que imprime el banco (16,1 MB
+para 250.000 claves, constante en las cuatro tiradas). Conviene ser preciso con
+lo que esa cifra es: una **estimación por fórmula** —bytes de clave más una
+constante por entrada—, no una medida de la memoria residente del proceso, que
+este banco sigue sin medir.
+
 ## Lo que no se mide, y por qué
 
 * **No hay comparación con Redis.** Una comparación honesta exige igualar la

@@ -230,3 +230,78 @@ Dicho aquí para que nadie lo descubra en producción:
   escribir en los ficheros puede falsificar registros con su CRC correcto. Los
   permisos del directorio son la defensa.
 * **El bloqueo del directorio no funciona sobre NFS.**
+
+## Caducidad, lotes, CAS y namespaces (Gate 7)
+
+Lo que conviene saber para operarlos; lo que son y lo que no está en
+`CAMBIOS.md`.
+
+### El formato en disco cambió, y eso afecta a bajar de versión
+
+El Gate 7 añadió un valor al byte `kind` del registro (`PutTtl`). La cabecera
+sigue midiendo 21 bytes y **un motor nuevo lee cualquier fichero viejo sin
+migración**. Al revés no: un motor anterior ve un registro con caducidad como
+corrupción y, si es el **último** del segmento, lo recorta en silencio.
+
+Consecuencia práctica: **en cuanto se escribe la primera clave con caducidad,
+volver a una versión anterior exige restaurar una copia previa a ese momento.**
+Si no se usa TTL, el formato en disco es idéntico al de antes y bajar de versión
+sigue siendo seguro.
+
+### La caducidad depende del reloj del sistema
+
+Es una comparación con el reloj de pared, porque un TTL es una promesa sobre el
+tiempo real y un reloj monótono no sobrevive a un reinicio. Por tanto:
+
+* Si el reloj **salta hacia atrás**, las claves viven más de lo pedido.
+* Si **salta hacia delante**, caducan antes.
+* Si el reloj dice algo anterior a 1970, **nada caduca**: ante un reloj
+  imposible, el motor prefiere no borrar.
+
+Con `ntp`/`chrony` normales esto no da problemas; sin sincronizar el reloj, un
+TTL no significa gran cosa.
+
+### El espacio de una clave caducada no vuelve hasta que se compacta
+
+La caducidad es **perezosa**: la clave deja de verse al instante, pero su
+registro sigue en el disco y su entrada sigue en el índice hasta la siguiente
+compactación. Lo que eso implica al operar:
+
+* `STATS keys` baja en cuanto caduca; `STATS index_bytes_est` **no**, porque
+  esa memoria sigue ocupada. No es una incoherencia: son dos preguntas
+  distintas.
+* Con muchas claves de vida corta y `auto_compact` desactivado, el índice crece
+  sin parar. Si se usa TTL en serio, **deja la auto-compactación encendida** o
+  programa `COMPACT`.
+* `CompactReport.expired_removed` (y la salida de `COMPACT`) dicen cuántas
+  retiró cada compactación.
+
+### `write_batch` no es una transacción
+
+Un lote es **un `fsync` para todas sus operaciones**, no un cambio atómico. Si
+el proceso muere a mitad, al reabrir puede quedar un prefijo. Está medido:
+lotes de 100 van entre 13 y 23 veces más rápido que operación a operación
+(`RENDIMIENTO.md`). No hay orden de lote en el protocolo de texto: es API de
+Rust.
+
+### `USE` es por conexión, y no aísla nada
+
+`USE app` pone `app:` delante de las claves de **esa** conexión y `KEYS` lo
+quita de la respuesta. No afecta a `STATS`, `HEALTH`, `METRICS`, `BACKUP` ni
+`COMPACT`, que son globales. Y **no es una frontera de seguridad**: cualquier
+cliente autenticado puede leer `app:k` sin hacer `USE`. La autenticación es una
+sola para todo el servidor.
+
+### El bucle correcto de un CAS por protocolo
+
+```
+GETSEQ clave        -> VALSEQ <seq> <valor>
+# calcular el valor nuevo a partir de <valor>
+CAS clave <seq> <valor nuevo>   -> OK   (hecho)
+                                -> NO <seq_actual>   (alguien se adelantó: repetir)
+```
+
+**`GETSEQ` y no `GET` + algo**: pedir el valor y el número de secuencia en dos
+órdenes distintas es una carrera, porque el `seq` puede quedar más nuevo que el
+valor leído y entonces el `CAS` escribe encima de un cambio ajeno. Es el fallo
+que tuvo la primera versión del CAS de este gate.

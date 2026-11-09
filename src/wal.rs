@@ -5,12 +5,18 @@
 //!
 //! ```text
 //! ┌────────┬────────┬─────────┬─────────┬──────┬───────┬───────┐
-//! │ crc32  │ seq    │ key_len │ val_len │ kind │ key   │ value │
+//! │ crc32  │ seq    │ key_len │ val_len │ kind │ key   │ carga │
 //! │ u32 LE │ u64 LE │ u32 LE  │ u32 LE  │ u8   │ bytes │ bytes │
 //! └────────┴────────┴─────────┴─────────┴──────┴───────┴───────┘
 //! ```
 //!
 //! - El CRC cubre todo lo que va detrás de él.
+//! - `kind` es 0 (`Put`), 1 (`Del`) o 2 (`PutTtl`). En los dos primeros la
+//!   carga es el valor tal cual; en el tercero son los 8 bytes de la fecha de
+//!   caducidad seguidos del valor, y `val_len` cuenta los dos. **La cabecera
+//!   mide 21 bytes en los tres casos**: el Gate 7 no cambió su forma, solo
+//!   añadió un valor posible del byte `kind`. El análisis de compatibilidad y
+//!   de migración está en `docs/CAMBIOS.md`.
 //! - `seq` es un número de secuencia global y creciente. Gracias a él el
 //!   estado se reconstruye sin depender del orden de los ficheros, lo que
 //!   permite que la compactación escriba en ficheros nuevos sin romper nada.
@@ -59,18 +65,62 @@ pub const MAX_VALUE: usize = 1 << 30;
 pub enum Kind {
     Put = 0,
     Del = 1,
+    /// Igual que `Put`, pero la carga lleva delante la fecha de caducidad:
+    /// `[caduca_ms_epoch: u64 LE][valor]`. La **cabecera no cambia**; lo único
+    /// nuevo es este valor del byte `kind`.
+    ///
+    /// Un motor anterior al Gate 7 ve este byte como desconocido y trata el
+    /// registro como corrupción: en modo estricto se niega a abrir sin tocar
+    /// nada, y en modo reparar lo salta declarando la pérdida. **Salvo si es el
+    /// último registro del segmento**, en cuyo caso no hay registro válido
+    /// detrás y lo recorta como cola incompleta, en silencio. El análisis
+    /// completo de compatibilidad está en `docs/CAMBIOS.md`.
+    PutTtl = 2,
 }
+
+/// Bytes que ocupa la fecha de caducidad delante del valor en un `PutTtl`.
+pub const TTL_BYTES: usize = 8;
+
+/// El valor más grande que admite un registro con caducidad. Es 8 bytes menor
+/// que el de un `Put` normal porque la caducidad va en la misma carga, y
+/// `val_len` sigue siendo el mismo `u32` de siempre.
+pub const MAX_VALUE_TTL: usize = MAX_VALUE - TTL_BYTES;
 
 /// Añade un registro codificado al final de `out`.
 pub fn encode(out: &mut Vec<u8>, seq: u64, kind: Kind, key: &[u8], value: &[u8]) {
+    codifica(out, seq, kind, key, None, value);
+}
+
+/// Añade un registro con caducidad. `caduca` es milisegundos desde la época; 0
+/// significaría «caducado en 1970», así que [`Kind::Put`] es la forma de decir
+/// «sin caducidad» y aquí no se admite 0.
+pub fn encode_ttl(out: &mut Vec<u8>, seq: u64, key: &[u8], value: &[u8], caduca: u64) {
+    debug_assert!(caduca > 0, "un PutTtl con caduca=0 no tiene sentido");
+    codifica(out, seq, Kind::PutTtl, key, Some(caduca), value);
+}
+
+fn codifica(
+    out: &mut Vec<u8>,
+    seq: u64,
+    kind: Kind,
+    key: &[u8],
+    caduca: Option<u64>,
+    value: &[u8],
+) {
     let base = out.len();
-    out.reserve(HEADER + key.len() + value.len());
+    let extra = if caduca.is_some() { TTL_BYTES } else { 0 };
+    out.reserve(HEADER + key.len() + extra + value.len());
     out.extend_from_slice(&[0, 0, 0, 0]); // hueco para el crc
     out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(&(key.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    // `val_len` cuenta la carga completa, caducidad incluida: así el lector
+    // sabe cuánto leer sin conocer el significado del `kind`.
+    out.extend_from_slice(&((value.len() + extra) as u32).to_le_bytes());
     out.push(kind as u8);
     out.extend_from_slice(key);
+    if let Some(c) = caduca {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
     out.extend_from_slice(value);
     let mut h = Hasher::new();
     h.update(&out[base + 4..]);
@@ -82,10 +132,25 @@ pub struct ReadRecord {
     pub seq: u64,
     pub kind: Kind,
     pub key: Vec<u8>,
+    /// **Solo el valor**: en un `PutTtl` los 8 bytes de la caducidad ya se han
+    /// quitado de aquí y están en `caduca`. Quien use esto no necesita saber
+    /// qué `kind` era.
     pub value: Vec<u8>,
+    /// Milisegundos desde la época en que la clave deja de ser visible, o **0
+    /// si no caduca**.
+    pub caduca: u64,
     /// Posición del registro dentro del fichero.
     pub offset: u64,
-    /// Posición absoluta del valor dentro del fichero.
+    /// Primer byte **después** del registro, calculado desde la cabecera.
+    ///
+    /// Existe para que avanzar al siguiente registro no dependa de
+    /// `value.len()`: el valor es un campo que se transforma —en un `PutTtl` se
+    /// le quitan los 8 bytes de la caducidad—, y calcular el avance a partir de
+    /// él dejaba al lector 8 bytes corto en cada registro con caducidad. Lo
+    /// cazó una prueba, pero era un error latente que convenía hacer imposible.
+    pub fin: u64,
+    /// Posición absoluta del valor dentro del fichero, ya pasada la caducidad
+    /// si la había. Apunta a lo que hay que devolver en un `get`.
     pub vpos: u64,
 }
 
@@ -111,6 +176,7 @@ impl Cause {
     }
 }
 
+#[derive(Debug)]
 pub enum ReadOutcome {
     Record(ReadRecord),
     /// Fin limpio del fichero.
@@ -149,6 +215,7 @@ fn decode_head(h: &[u8; HEADER]) -> Option<Head> {
     let kind = match h[20] {
         0 => Kind::Put,
         1 => Kind::Del,
+        2 => Kind::PutTtl,
         _ => return None,
     };
     Some(Head {
@@ -234,13 +301,34 @@ impl<R: BufRead + Seek> SegmentReader<R> {
         if hs.finish() != head.crc {
             return Ok(Parsed::Bad(Cause::CrcIncorrecto));
         }
+        // La caducidad se separa aquí, una sola vez, para que nadie más tenga
+        // que saber que un `PutTtl` lleva 8 bytes delante del valor.
+        let mut caduca = 0u64;
+        let mut vpos = off + HEADER as u64 + head.klen as u64;
+        if head.kind == Kind::PutTtl {
+            if value.len() < TTL_BYTES {
+                // El CRC cuadra, así que el registro se escribió así: el byte
+                // `kind` dice que hay una caducidad y la carga no da para
+                // tenerla. Es un registro inutilizable, y se trata como tal en
+                // vez de inventarse una fecha.
+                return Ok(Parsed::Bad(Cause::CabeceraInvalida));
+            }
+            caduca = u64::from_le_bytes(value[..TTL_BYTES].try_into().unwrap());
+            // Se quita el prefijo moviendo en el sitio, sin reservar otro Vec.
+            value.copy_within(TTL_BYTES.., 0);
+            value.truncate(value.len() - TTL_BYTES);
+            vpos += TTL_BYTES as u64;
+        }
         Ok(Parsed::Ok(ReadRecord {
             seq: head.seq,
             kind: head.kind,
             key,
             value,
+            caduca,
             offset: off,
-            vpos: off + HEADER as u64 + head.klen as u64,
+            // Desde la cabecera, no desde `value`, que ya puede estar recortado.
+            fin: off + total,
+            vpos,
         }))
     }
 
@@ -322,7 +410,7 @@ impl<R: BufRead + Seek> SegmentReader<R> {
         self.needs_seek = false;
         match self.parse_at(start, seek)? {
             Parsed::Ok(r) => {
-                self.offset = start + HEADER as u64 + r.key.len() as u64 + r.value.len() as u64;
+                self.offset = r.fin;
                 Ok(ReadOutcome::Record(r))
             }
             Parsed::Bad(cause) => {
@@ -556,8 +644,106 @@ mod tests {
         ));
     }
 
-    /// Un `kind` desconocido se señala como cabecera inválida, no como CRC.
     #[test]
+    /// El registro con caducidad va y vuelve, y el lector deja el valor
+    /// **limpio**: quien lo usa no tiene que saber que había 8 bytes delante.
+    fn ida_y_vuelta_con_caducidad() {
+        let mut buf = Vec::new();
+        encode_ttl(&mut buf, 9, b"sesion", b"token-abc", 1_794_182_400_000);
+        encode(&mut buf, 10, Kind::Put, b"normal", b"sin caducidad");
+        let primero_len = (HEADER + 6 + TTL_BYTES + 9) as u64;
+
+        let mut rd = reader(buf);
+        match rd.siguiente().unwrap() {
+            ReadOutcome::Record(r) => {
+                assert_eq!(r.kind, Kind::PutTtl);
+                assert_eq!(r.key, b"sesion");
+                assert_eq!(r.value, b"token-abc", "el valor sale sin la caducidad");
+                assert_eq!(r.caduca, 1_794_182_400_000);
+                // `vpos` tiene que apuntar al valor, no a la caducidad: es lo
+                // que el índice guarda y lo que `get` lee del disco.
+                assert_eq!(r.vpos, (HEADER + 6 + TTL_BYTES) as u64);
+            }
+            otro => panic!("esperaba registro con caducidad: {otro:?}"),
+        }
+        match rd.siguiente().unwrap() {
+            ReadOutcome::Record(r) => {
+                assert_eq!(r.kind, Kind::Put);
+                assert_eq!(r.caduca, 0, "un Put normal no caduca");
+                assert_eq!(r.value, b"sin caducidad");
+                assert_eq!(r.offset, primero_len);
+            }
+            otro => panic!("esperaba registro normal: {otro:?}"),
+        }
+        assert!(matches!(rd.siguiente().unwrap(), ReadOutcome::End));
+    }
+
+    #[test]
+    /// Un `PutTtl` cuya carga no da ni para la caducidad es un registro
+    /// inutilizable aunque el CRC cuadre. No se inventa una fecha.
+    fn un_putttl_sin_sitio_para_la_caducidad_no_se_acepta() {
+        let mut buf = Vec::new();
+        // Se codifica a mano: `encode_ttl` nunca produciría esto.
+        codifica(&mut buf, 1, Kind::PutTtl, b"k", None, b"abc");
+        encode(&mut buf, 2, Kind::Put, b"otra", b"valida");
+        let mut rd = reader(buf);
+        match rd.siguiente().unwrap() {
+            ReadOutcome::Corrupt { cause, .. } => {
+                assert_eq!(cause, Cause::CabeceraInvalida)
+            }
+            otro => panic!("esperaba corrupción: {otro:?}"),
+        }
+    }
+
+    #[test]
+    /// La otra mitad del análisis de compatibilidad: un `kind` que el lector no
+    /// conoce **con registros válidos detrás** es corrupción, que es ruidosa.
+    /// Es exactamente lo que vería un motor anterior al Gate 7 ante un
+    /// `PutTtl`, porque este es el mismo lector.
+    fn un_kind_del_futuro_con_algo_detras_es_corrupcion_ruidosa() {
+        let mut buf = Vec::new();
+        encode(&mut buf, 1, Kind::Put, b"hola", b"mundo");
+        encode(&mut buf, 2, Kind::Put, b"otra", b"valida");
+        let primero_len = (HEADER + 4 + 5) as u64;
+        // Un kind que esta versión tampoco conoce: 9.
+        buf[20] = 9;
+        let mut rd = reader(buf);
+        match rd.siguiente().unwrap() {
+            ReadOutcome::Corrupt {
+                cause, resync_at, ..
+            } => {
+                assert_eq!(cause, Cause::CabeceraInvalida);
+                assert_eq!(resync_at, primero_len);
+            }
+            otro => panic!("esperaba corrupción: {otro:?}"),
+        }
+    }
+
+    #[test]
+    /// Y la fila incómoda de la tabla de compatibilidad, probada en vez de
+    /// solo advertida: un `kind` desconocido **en el último registro** no hay
+    /// manera de distinguirlo de una escritura a medias, así que se recorta en
+    /// silencio. Por eso bajar de versión tras usar TTL puede perder lo último
+    /// escrito.
+    fn un_kind_del_futuro_al_final_se_recorta_en_silencio() {
+        let mut buf = Vec::new();
+        encode(&mut buf, 1, Kind::Put, b"hola", b"mundo");
+        let primero_len = buf.len() as u64;
+        encode(&mut buf, 2, Kind::Put, b"ultima", b"se va a perder");
+        buf[primero_len as usize + 20] = 9;
+        let mut rd = reader(buf);
+        assert!(matches!(rd.siguiente().unwrap(), ReadOutcome::Record(_)));
+        match rd.siguiente().unwrap() {
+            ReadOutcome::IncompleteTail { at, cause } => {
+                assert_eq!(at, primero_len);
+                assert_eq!(cause, Cause::CabeceraInvalida);
+            }
+            otro => panic!("esperaba cola incompleta: {otro:?}"),
+        }
+    }
+
+    #[test]
+    /// Un `kind` desconocido se señala como cabecera inválida, no como CRC.
     fn kind_desconocido_es_cabecera_invalida() {
         let mut buf = two_records();
         let first_len = (HEADER + 4 + 5) as u64;
